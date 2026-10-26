@@ -13,28 +13,15 @@
 # limitations under the License.
 """Mixed-precision GEMM with weight-only integer quantization.
 
-Port of DeepSpeed's ``mixed_gemm`` (``csrc/quantization/mixed_gemm.cpp`` and
-``fastertransformer``'s ``CutlassFpAIntBGemmRunner``): fp16/bf16 activations against an
-int4/int8 weight with a per-output-channel scale, dequantized in the kernel's operand
-fetch. ``weight`` arrives already quantized and packed in DeepSpeed's
-``preprocess_weights_for_mixed_gemm`` layout (pinned by ``mixed_gemm_B_layout.h``); this
-operator performs no quantization.
+Port of DeepSpeed's ``mixed_gemm``: fp16/bf16 activations against an int4/int8 weight with a
+per-output-channel scale, dequantized during the operand fetch. ``weight`` arrives already
+packed in DeepSpeed's ``preprocess_weights_for_mixed_gemm`` layout; nothing is quantized here.
+The gated activations are declared but rejected, as DeepSpeed's runner rejects them.
 
-Deviations: the gated activations (``GEGLU``/``ReGLU``/``SiGLU``) are declared but rejected,
-as DeepSpeed's runner rejects them; the activation is selected by a ``tl.constexpr`` rather
-than at C++ template instantiation, which keeps one kernel instead of four.
-
-MetaX override: two schedules, chosen by shape.
-
-* ``m >= 256``: unpack the weight once into a dense buffer, then a plain GEMM. The fused
-  kernel re-unpacks the weight in every m-tile, and here one full unpack pass costs 0.05 ms
-  against the 1.31 ms it feeds.
-* otherwise: the fused kernel, which serves small m where the pass would dominate.
-
-The buffer is per call, never cached. This backend also lowers bf16 as ``i16`` in LLVM IR, so
-an ``uitofp`` straight to bf16 fails once the value becomes an MMA operand
-(``llvm.uitofp ... got 'i16'``); the weight therefore crosses fp32, which is exact for
-int4/int8 and leaves every result unchanged.
+MetaX: the default schedule unpacks the weight once into a dense buffer and runs a plain
+GEMM; the fused kernel is kept for pinned tiles and shapes the unpack cannot take. The buffer
+is per call, never cached. This backend lowers bf16 as ``i16``, so the weight crosses fp32,
+which is exact for int4/int8.
 """
 
 import logging
@@ -50,7 +37,7 @@ from flag_train.utils import triton_lang_extension as tle
 
 logger = logging.getLogger(__name__)
 
-# ``ActivationType`` values, from DeepSpeed's ``utils/activation_type.h``. ``IDENTITY`` is 6, not 0.
+# ``ActivationType`` values, from DeepSpeed's ``utils/activation_type.h``. ``IDENTITY`` is 6.
 GELU = tl.constexpr(0)
 RELU = tl.constexpr(1)
 SILU = tl.constexpr(2)
@@ -89,10 +76,8 @@ def mixed_gemm_kernel(
 ):
     """Weight-only dequantization fused into a tiled GEMM.
 
-    Mirrors ``CutlassFpAIntBGemmRunner::gemm_bias_act``: ``w = (q - 2**(bits-1)) * scale[n]``
-    is computed as the tile is fetched, the product accumulates in fp32, and the epilogue
-    adds the bias and applies the activation. ``scale[n]`` carries no ``k``, so it is hoisted
-    out of the reduction.
+    ``w = (q - 2**(bits-1)) * scale[n]`` is applied as the tile is fetched, the product
+    accumulates in fp32, and the epilogue adds the bias and the activation.
     """
     pid_m = tle.program_id(0)
     pid_n = tle.program_id(1)
@@ -177,14 +162,28 @@ def mixed_gemm_kernel(
     )
 
 
-# Dense-GEMM tile: BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages. Measured on C550 at
-# 8192x4096x2048 and 4096^3 (both 104.6 and 104.9 TFLOP/s). Everything either side of it
-# falls off a cliff, not gently: BLOCK_K=64 gives 41, BLOCK_N=256 gives 14, 4 warps gives
-# 8.5. L2 grouping is flat here (GROUP_M 4/8/16 differ by 0.3%), so 8 is arbitrary.
-_SPLIT_TILE = (128, 128, 32, 8, 4)
+# Dense-GEMM tiles: BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages. The wide tile is the
+# fastest per CTA (123 TFLOP/s at 4096^3, 47% of the vendor library) but needs ~512 CTAs to
+# fill the part.
+_WIDE_TILE = (128, 256, 16, 8, 4)
+_MID_TILE = (64, 128, 32, 4, 4)
+_NARROW_TILE = (128, 128, 32, 8, 4)
+# Below one narrow row-block: shrink BLOCK_M instead of leaving it half empty.
+_THIN_TILE = (32, 128, 32, 4, 4)
+_FILL_CTAS = 512
+
+
+def _split_tile(m, n):
+    """Widest tile that still yields enough CTAs, narrowest if none does."""
+    for tile in (_WIDE_TILE, _MID_TILE):
+        if (m // tile[0]) * (n // tile[1]) >= _FILL_CTAS:
+            return tile
+    if m < _NARROW_TILE[0]:
+        return _THIN_TILE
+    return _NARROW_TILE
+
+
 _GROUP_M = 8
-# Below this a full unpack pass costs more than it saves.
-_SPLIT_MIN_M = 256
 # Unpack program: elements of k and n per launch.
 _DQ_BLOCK_K = 64
 _DQ_BLOCK_N = 128
@@ -200,11 +199,7 @@ def _dequant_kernel(
     BLOCK_K: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    """Unpack a tile of the weight into a dense ``(k, n)`` buffer.
-
-    Same slot arithmetic as the fused kernel's fetch, and the same ``value - zero_point``.
-    Scales stay out: they belong to the epilogue.
-    """
+    """Unpack a tile of the weight into a dense ``(k, n)`` buffer."""
     pid_k = tl.program_id(0)
     pid_n = tl.program_id(1)
     koff = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
@@ -236,7 +231,7 @@ def _dequant_kernel(
         hi = (packed >> 4) & 0x0F
         wq = tl.where((slot % 2) == 1, hi, lo)
 
-    # Via fp32 for the same reason the fused kernel does.
+    # Via fp32, as in the fused kernel.
     w = (wq.to(tl.float32) - (1 << (NUM_BITS - 1))).to(out_ptr.dtype.element_ty)
     tl.store(out_ptr + koff[:, None] * n + cols[None, :], w, mask=wmask)
 
@@ -263,8 +258,7 @@ def _split_gemm_kernel(
 ):
     """Dense GEMM over the unpacked weight, with the operator's epilogue.
 
-    Dispatch guarantees ``n % BLOCK_N == 0`` and ``k % BLOCK_K == 0``, so only the m edge is
-    masked. Grouped pid order keeps a column block of B hot across a group of row blocks.
+    ``n % BLOCK_N`` and ``k % BLOCK_K`` hold by dispatch, so only the m edge is masked.
     """
     pid = tl.program_id(0)
     num_pid_n = n // BLOCK_N
@@ -309,10 +303,8 @@ def _split_gemm_kernel(
     )
 
 
-# Fused-kernel tile, for the shapes below ``_SPLIT_MIN_M``. ``BLOCK_N`` dominates: the
-# weight fetch is a gather whose volume scales with N, so halving N halves the gather and
-# ``BLOCK_M`` goes up to put the arithmetic intensity back. 256/32/32 wins 12 of the 14
-# benchmarked shapes (+0.139 mean over 128/64/32) and loses the two thinnest (m = 1, 64).
+# Fused-kernel tile, for the shapes the unpack pass cannot take. ``BLOCK_N`` dominates: the
+# weight fetch is a gather whose volume scales with N. 256/32/32 wins 12 of the 14 shapes.
 _DEFAULT_TILE = {
     "BLOCK_M": 256,
     "BLOCK_N": 32,
@@ -321,9 +313,7 @@ _DEFAULT_TILE = {
     "num_stages": 3,
 }
 
-# Hygon's warp is 64 lanes, and on gfx936 the sweep above inverts: 128/64/32 wins all
-# nine shapes measured, with bit-identical output. The backend now ships its own
-# override, so this applies only to a build running the generic kernel on Hygon.
+# Hygon's warp is 64 lanes and the sweep inverts there; only a generic-kernel build sees this.
 if runtime_device.vendor_name == "hygon":
     _DEFAULT_TILE["BLOCK_M"] = 128
     _DEFAULT_TILE["BLOCK_N"] = 64
@@ -341,10 +331,11 @@ def _mixed_gemm_split(
     m,
     n,
     k,
+    tile,
 ):
     """Unpack the weight once, then a dense GEMM."""
     dense = torch.empty((k, n), dtype=hidden_states.dtype, device=hidden_states.device)
-    block_m, block_n, block_k, warps, stages = _SPLIT_TILE
+    block_m, block_n, block_k, warps, stages = tile
 
     with torch_device_fn.device(hidden_states.device):
         _dequant_kernel[(triton.cdiv(k, _DQ_BLOCK_K), triton.cdiv(n, _DQ_BLOCK_N))](
@@ -388,9 +379,8 @@ def _check_launch_arguments(
 ):
     """Validate one ``mixed_gemm`` call and return ``(m, n, k)``.
 
-    Shared with the backends that override the kernel, so no backend accepts a call another
-    one rejects. These reproduce the launcher's ``TORCH_CHECK``s; the device check is the one
-    addition.
+    Shared with the overriding backends so no backend accepts a call another one rejects;
+    these reproduce the launcher's ``TORCH_CHECK``s plus a device check.
     """
     if num_bits not in (4, 8):
         raise ValueError(f"Data width must be 4 or 8, got {num_bits}")
@@ -412,14 +402,13 @@ def _check_launch_arguments(
     if bias is not None and bias.numel() != n:
         raise ValueError(f"Expected {n} bias entries, got {bias.numel()}")
 
-    # gemm_bias_act rejects anything outside the four epilogues it instantiates.
+    # Outside the four epilogues the runner instantiates.
     if activation_raw not in _SUPPORTED_ACTIVATIONS:
         if activation_raw in _GATED_ACTIVATIONS:
             raise ValueError("Fused gated activations not supported")
         raise ValueError(f"Invalid activation type: {activation_raw}")
 
-    # Against the runtime's name rather than a hard-coded "cuda": the same source runs
-    # on npu and hcu. A CPU tensor is still rejected.
+    # Against the runtime's name, not a hard-coded "cuda": the same source runs on npu and hcu.
     for name, tensor in (
         ("output", output),
         ("hidden_states", hidden_states),
@@ -436,8 +425,7 @@ def _check_launch_arguments(
         raise ValueError("hidden_states must be contiguous")
     if not output.is_contiguous():
         raise ValueError("output must be contiguous")
-    # The preprocessed layout is a permutation of the weight's *bytes*, addressed
-    # flat, so the tensor's own 2-D shape carries no meaning here.
+    # The packed layout is addressed flat, so the 2-D shape carries no meaning here.
     if not weight.is_contiguous():
         raise ValueError("weight must be contiguous")
 
@@ -497,25 +485,23 @@ def mixed_gemm(
     # Only read when HAS_BIAS, so the output doubles as the stand-in pointer.
     bias_in = bias if has_bias else output
 
-    if (
-        not pinned
-        and m >= _SPLIT_MIN_M
-        and n % _SPLIT_TILE[1] == 0
-        and k % _SPLIT_TILE[2] == 0
-    ):
-        return _mixed_gemm_split(
-            output,
-            hidden_states,
-            weight,
-            scales,
-            bias_in,
-            has_bias,
-            num_bits,
-            activation_raw,
-            m,
-            n,
-            k,
-        )
+    if not pinned:
+        tile = _split_tile(m, n)
+        if n % tile[1] == 0 and k % tile[2] == 0:
+            return _mixed_gemm_split(
+                output,
+                hidden_states,
+                weight,
+                scales,
+                bias_in,
+                has_bias,
+                num_bits,
+                activation_raw,
+                m,
+                n,
+                k,
+                tile,
+            )
 
     grid = (triton.cdiv(m, BLOCK_M), triton.cdiv(n, BLOCK_N))
     with torch_device_fn.device(hidden_states.device):
