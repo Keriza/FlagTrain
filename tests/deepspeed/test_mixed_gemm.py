@@ -391,14 +391,32 @@ def pack_signed(q, num_bits, k, n):
     return (qs[:, 0::2] | (qs[:, 1::2] << 4)).to(torch.uint8).reshape(-1)
 
 
+# The reference is fp64, and not every backend can compute an fp64 GEMM: CoreX rejects
+# ``double`` outright, and the backend declares that through ``runtime_device.support_fp64``
+# -- the same flag ``accuracy_utils`` reads. Such a backend gets ``--ref cpu``'s
+# arrangement, reference on the host and kernel on the device, without the option: an fp32
+# reference would add its own error to the one being measured. Every shape here is small,
+# so the host trip is free.
+_REF_ON_HOST = utils.TO_CPU or not runtime_device.support_fp64
+
+
 def _reference_copy(tensor):
-    """A reference-side copy.
+    """A reference-side copy, on the host when the device has no fp64 GEMM.
 
     ``utils.to_reference`` moves it to the CPU under ``--ref cpu``, which is what makes
     the reference an independent oracle rather than a second reading of the device
     arithmetic.
     """
-    return utils.to_reference(tensor.clone() if tensor is not None else None)
+    if tensor is None:
+        return None
+    if _REF_ON_HOST:
+        return tensor.detach().to("cpu", copy=True)
+    return utils.to_reference(tensor.clone())
+
+
+def _ref64(tensor):
+    """An fp64 operand for a reference-side expression."""
+    return _reference_copy(tensor).to(torch.float64)
 
 
 def mixed_gemm_ref(
@@ -413,10 +431,10 @@ def mixed_gemm_ref(
     Accumulates in fp64 -- the operator accumulates in fp32, and an fp32 reference
     would add its own error on top of the one being measured.
     """
-    if utils.TO_CPU:
-        # ``--ref cpu`` promises the reference *computation* is on the CPU, not only its
-        # result; asserting it here makes a test that forgets ``_reference_copy`` fail
-        # loudly instead of quietly becoming a second reading of the device arithmetic.
+    if _REF_ON_HOST:
+        # The reference *computation* has to be on the CPU, not only its result;
+        # asserting it here makes a test that forgets ``_reference_copy`` fail loudly
+        # instead of quietly becoming a second reading of the device arithmetic.
         for name, operand in (
             ("hidden_states", hidden_states),
             ("weight", weight),
@@ -428,11 +446,11 @@ def mixed_gemm_ref(
             )
 
     q = weight
-    dequant = q.to(torch.float64) * scales.to(torch.float64)[None, :]
+    dequant = _ref64(q) * _ref64(scales)[None, :]
 
-    ref = hidden_states.to(torch.float64) @ dequant
+    ref = _ref64(hidden_states) @ dequant
     if bias is not None:
-        ref = ref + bias.to(torch.float64)[None, :]
+        ref = ref + _ref64(bias)[None, :]
 
     # The activation sees the bias: DeepSpeed's epilogues are all
     # ``EpilogueOpBias<Act>``. IDENTITY (6) does nothing.
@@ -664,10 +682,8 @@ def test_mixed_gemm_with_bias(shape, num_bits, dtype):
 
     # The case above only discriminates if some element actually lands below
     # -|bias|; otherwise both orderings agree and the test proves nothing.
-    pre = hidden.to(torch.float64) @ (
-        q.to(torch.float64) * scales.to(torch.float64)[None, :]
-    )
-    assert bool((pre < -bias.to(torch.float64).abs()[None, :]).any()), (
+    pre = _ref64(hidden) @ (_ref64(q) * _ref64(scales)[None, :])
+    assert bool((pre < -_ref64(bias).abs()[None, :]).any()), (
         "no element has a pre-activation below -|bias|, so this case cannot "
         "distinguish the bias/activation order; change the seed"
     )
@@ -693,15 +709,10 @@ def test_mixed_gemm_matches_theoretical_bound(num_bits, dtype):
 
     mixed_gemm(output, hidden, packed, scales, None, num_bits, 6)  # IDENTITY
 
-    exact = hidden.to(torch.float64) @ (
-        q.to(torch.float64) * scales.to(torch.float64)[None, :]
-    )
+    exact = _ref64(hidden) @ (_ref64(q) * _ref64(scales)[None, :])
 
-    err = (output.to(torch.float64) - exact).abs()
-    bound = (
-        scales.to(torch.float64)[None, :]
-        * hidden.to(torch.float64).abs().sum(dim=1)[:, None]
-    )
+    err = (_ref64(output) - exact).abs()
+    bound = _ref64(scales)[None, :] * _ref64(hidden).abs().sum(dim=1)[:, None]
     assert bool((err <= bound).all()), (
         f"{num_bits}-bit error {err.max().item():.4e} exceeds the bound "
         f"{bound.max().item():.4e} (worst usage "
