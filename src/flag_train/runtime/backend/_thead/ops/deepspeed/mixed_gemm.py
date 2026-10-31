@@ -35,8 +35,8 @@ from flag_train.deepspeed.mixed_gemm import (
     GELU,
     RELU,
     SILU,
+    _DEFAULT_TILE,
     _check_launch_arguments,
-    _flat_tile,
 )
 from flag_train.deepspeed.mixed_gemm import mixed_gemm as _generic_mixed_gemm
 from flag_train.runtime import torch_device_fn
@@ -326,8 +326,10 @@ def mixed_gemm(
     # A pinned tile means a measurement; the generic entry already handles that case.
     tile = None
     if BLOCK_M is None and BLOCK_N is None and BLOCK_K is None:
-        tile = _flat_tile(m, n, k)
-        if tile is not None and m > 128 and n % 128 == 0:
+        # The generic module's flat default, copied: that dict is module level and the
+        # Hygon fallback rewrites it in place.
+        tile = dict(_DEFAULT_TILE)
+        if m > 128 and n % 128 == 0:
             tile = dict(_WIDE_TILE)
     if tile is None:
         return _generic_mixed_gemm(
