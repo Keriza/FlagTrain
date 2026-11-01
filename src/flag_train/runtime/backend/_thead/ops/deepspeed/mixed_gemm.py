@@ -32,7 +32,6 @@ import triton
 import triton.language as tl
 
 from flag_train.deepspeed.mixed_gemm import (
-    _DEFAULT_TILE,
     GELU,
     RELU,
     SILU,
@@ -58,6 +57,33 @@ _WIDE_TILE = {
     "num_warps": 8,
     "num_stages": 3,
 }
+
+# Whole 64-row runs force BLOCK_K=64. For thin m, BLOCK_N goes up and BLOCK_M drops:
+# weight traffic no longer scales with BLOCK_N. On PPU at k=n=4096, m=1 is 0.0769 ms at
+# 64 rows vs 0.2351 ms at 256.
+_FLAT_BLOCK_K = 64
+
+
+def _flat_tile(m, n, k):
+    """Tile for the fused kernel, or ``None`` when the tile would need masks."""
+    if k % _FLAT_BLOCK_K:
+        return None
+    block_n = next((c for c in (64, 32, 16) if n % c == 0), None)
+    if block_n is None:
+        return None
+    if m <= 64:
+        block_m = 64
+    elif m <= 128:
+        block_m = 128
+    else:
+        block_m = 256
+    return {
+        "BLOCK_M": block_m,
+        "BLOCK_N": block_n,
+        "BLOCK_K": _FLAT_BLOCK_K,
+        "num_warps": 4,
+        "num_stages": 3,
+    }
 
 
 @triton.jit
@@ -326,12 +352,8 @@ def mixed_gemm(
     # A pinned tile means a measurement; the generic entry already handles that case.
     tile = None
     if BLOCK_M is None and BLOCK_N is None and BLOCK_K is None:
-        # The generic module's flat default, copied: that dict is module level and the
-        # Hygon fallback rewrites it in place.
-        tile = dict(_DEFAULT_TILE)
-        # The run-based kernel works in whole 64-row runs, whatever the generic default is.
-        tile["BLOCK_K"] = 64
-        if m > 128 and n % 128 == 0:
+        tile = _flat_tile(m, n, k)
+        if tile is not None and m > 128 and n % 128 == 0:
             tile = dict(_WIDE_TILE)
     if tile is None:
         return _generic_mixed_gemm(
@@ -373,12 +395,6 @@ def mixed_gemm(
     BLOCK_K = tile["BLOCK_K"]
     num_warps = tile["num_warps"]
     num_stages = tile["num_stages"]
-
-    if k % BLOCK_K or n % BLOCK_N:
-        # The loads are unmasked whole runs; shapes that do not divide go to the gather kernel.
-        return _generic_mixed_gemm(
-            output, hidden_states, weight, scales, bias, num_bits, activation_raw
-        )
 
     grid = (triton.cdiv(m, BLOCK_M), triton.cdiv(n, BLOCK_N))
     with torch_device_fn.device(hidden_states.device):
