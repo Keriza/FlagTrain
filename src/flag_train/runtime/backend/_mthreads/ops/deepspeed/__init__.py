@@ -18,13 +18,10 @@ module here as the generic one it replaces -- ``deepspeed/lamb.py`` beside
 ``flag_train/deepspeed/lamb.py`` -- so which generic module an override belongs to
 is readable from the path.
 
-``mixed_gemm`` is specialised here: on this part the generic kernel's per-element
-weight gather costs more than unpacking the weight once and running a dense GEMM.
-To specialise another, define it under this package, re-export it here
-(``from .lamb import lamb``) and list it in ``__all__``, which is what
-``SpecOpRegistrar`` registers.
+Empty on purpose: no ``flag_train.deepspeed`` operator has a MUSA kernel of its
+own yet -- hence the empty ``__all__``. To specialise one, define it under this
+package, re-export it here (``from .lamb import lamb``) and list it in ``__all__``,
+which is what ``SpecOpRegistrar`` registers.
 """
 
-from .mixed_gemm import mixed_gemm
-
-__all__ = ["mixed_gemm"]
+__all__ = []
