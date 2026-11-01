@@ -329,6 +329,8 @@ def mixed_gemm(
         # The generic module's flat default, copied: that dict is module level and the
         # Hygon fallback rewrites it in place.
         tile = dict(_DEFAULT_TILE)
+        # The run-based kernel works in whole 64-row runs, whatever the generic default is.
+        tile["BLOCK_K"] = 64
         if m > 128 and n % 128 == 0:
             tile = dict(_WIDE_TILE)
     if tile is None:
@@ -371,6 +373,12 @@ def mixed_gemm(
     BLOCK_K = tile["BLOCK_K"]
     num_warps = tile["num_warps"]
     num_stages = tile["num_stages"]
+
+    if k % BLOCK_K or n % BLOCK_N:
+        # The loads are unmasked whole runs; shapes that do not divide go to the gather kernel.
+        return _generic_mixed_gemm(
+            output, hidden_states, weight, scales, bias, num_bits, activation_raw
+        )
 
     grid = (triton.cdiv(m, BLOCK_M), triton.cdiv(n, BLOCK_N))
     with torch_device_fn.device(hidden_states.device):
