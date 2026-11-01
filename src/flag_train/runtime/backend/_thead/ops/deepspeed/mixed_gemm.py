@@ -32,10 +32,10 @@ import triton
 import triton.language as tl
 
 from flag_train.deepspeed.mixed_gemm import (
+    _DEFAULT_TILE,
     GELU,
     RELU,
     SILU,
-    _DEFAULT_TILE,
     _check_launch_arguments,
 )
 from flag_train.deepspeed.mixed_gemm import mixed_gemm as _generic_mixed_gemm
