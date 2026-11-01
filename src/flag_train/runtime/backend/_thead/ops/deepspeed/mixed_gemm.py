@@ -31,12 +31,7 @@ import torch
 import triton
 import triton.language as tl
 
-from flag_train.deepspeed.mixed_gemm import (
-    GELU,
-    RELU,
-    SILU,
-    _check_launch_arguments,
-)
+from flag_train.deepspeed.mixed_gemm import GELU, RELU, SILU, _check_launch_arguments
 from flag_train.deepspeed.mixed_gemm import mixed_gemm as _generic_mixed_gemm
 from flag_train.runtime import torch_device_fn
 from flag_train.utils import tl_extra_shim
