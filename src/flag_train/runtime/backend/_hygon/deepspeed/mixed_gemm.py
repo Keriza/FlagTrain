@@ -309,7 +309,7 @@ def mixed_gemm(
     Returns:
         Tensor: ``output``, updated in place.
     """
-    logger.debug("TRAIN MIXED_GEMM (dequantize + BLAS)")
+    logger.debug("TRAIN_HYGON MIXED_GEMM")
 
     m, n, k = _check_launch_arguments(
         output, hidden_states, weight, scales, bias, num_bits, activation_raw
