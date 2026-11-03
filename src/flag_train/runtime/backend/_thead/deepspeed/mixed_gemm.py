@@ -338,7 +338,7 @@ def mixed_gemm(
     num_stages=None,
 ):
     """Mixed-precision GEMM with weight-only integer quantization."""
-    logger.debug("TRAIN MIXED_GEMM")
+    logger.debug("TRAIN_THEAD MIXED_GEMM")
 
     m, n, k = _check_launch_arguments(
         output, hidden_states, weight, scales, bias, num_bits, activation_raw
