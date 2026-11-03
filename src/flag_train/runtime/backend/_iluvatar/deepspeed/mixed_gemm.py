@@ -178,7 +178,7 @@ def mixed_gemm(
     Returns:
         Tensor: ``output``, updated in place.
     """
-    logger.debug("TRAIN MIXED_GEMM")
+    logger.debug("TRAIN_ILUVATAR MIXED_GEMM")
 
     m, n, k = _check_launch_arguments(
         output, hidden_states, weight, scales, bias, num_bits, activation_raw
