@@ -19,9 +19,10 @@ is a port *of*. When that kernel cannot run, the baseline is Megatron's own
 ``native_h_aggregate``, the ``@torch.compile``d torch composition the vendor
 defines this stage as; with an older megatron-core that predates it, the
 transcription below is compiled the way Megatron compiles it. On Ascend the
-composition is timed eagerly: that runtime's profiler-backed timer cannot time
-a graph-captured call (see ``FusedHAggregateForwardBenchmark.get_latency``).
-``_BASELINE`` records which case was measured.
+baseline is the eager composition -- Megatron's kernel exceeds that device's
+core-dim limit at the larger shapes -- and it is timed with a wall-clock loop
+(see ``FusedHAggregateForwardBenchmark.get_latency``). ``_BASELINE`` records
+which case was measured.
 
 Both sides take the same ``(x, h_pre)`` tuple and return the aggregated
 ``[s, b, C]``, so there is nothing to pre-compute outside the timed region. The
@@ -127,6 +128,20 @@ def _full_compile_budget():
 
 def _load_baseline():
     """Megatron's Triton forward kernel, else its ``native_h_aggregate``."""
+    if _IS_ASCEND:
+        # Megatron's kernel launches one program per output tile. On Ascend that
+        # count passes the 65535 core-dim limit once the sweep reaches
+        # (256, 32, ..., 7168): EE1003, "value 524288 for parameter coreDim is
+        # invalid", raised from its own autotuner. A smoke test at (1, 1, 2, 8)
+        # does not show it, so the kernel is not used here at all.
+        warnings.warn(
+            "Megatron-LM's Triton fused_h_aggregate_forward kernel exceeds the "
+            "Ascend core-dim limit at the larger shapes of this sweep; timing "
+            "its eager native_h_aggregate composition instead.",
+            stacklevel=2,
+        )
+        op, source = _load_native_h_aggregate(compile_it=False)
+        return op, f"megatron native_h_aggregate ({source}, eager)"
     try:
         from megatron.core.fusions.fused_mhc_kernels import _triton_h_aggregate_fwd
 
@@ -144,13 +159,7 @@ def _load_baseline():
             stacklevel=2,
         )
 
-    op, source = _load_native_h_aggregate(compile_it=not _IS_ASCEND)
-    if _IS_ASCEND:
-        # On the Ascend runtime the compiled composition cannot be timed: the
-        # profiler-backed timer reads events the graph-captured call never
-        # records (aclrtEventElapsedTime 507000, and 0.0 ms before that). The
-        # eager composition is what a training step pays there anyway.
-        return op, f"megatron native_h_aggregate ({source}, eager)"
+    op, source = _load_native_h_aggregate(compile_it=True)
     return op, f"megatron native_h_aggregate ({source}, @torch.compile)"
 
 
@@ -177,12 +186,12 @@ class FusedHAggregateForwardBenchmark(base.GenericBenchmark):
     def get_latency(self, op, *args, **kwargs):
         """Milliseconds per call.
 
-        Ascend's kernel-mode timer is profiler-backed: on the CI runtime the
+        Ascend's kernel-mode timer is profiler-backed. On the CI runtime the
         profiler comes back with no events ("Failed to get acl to npu flow
-        events") and the torch.npu events it reads are never recorded, which
-        reads as 0.0 ms and then raises ``aclrtEventElapsedTime`` 507000. A
-        synchronized wall-clock loop needs neither, and every shape in the
-        sweep runs long enough that the launch is not what is being measured.
+        events") and the torch.npu events it reads either read as 0.0 ms or
+        raise ``aclrtEventElapsedTime`` 507000. A synchronized wall-clock loop
+        needs neither, and every shape in the sweep runs long enough that the
+        launch is not what is being measured.
         """
         if not _IS_ASCEND:
             return super().get_latency(op, *args, **kwargs)
