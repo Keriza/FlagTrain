@@ -156,6 +156,10 @@ class FusedHAggregateForwardBenchmark(base.GenericBenchmark):
 
     def get_gbps(self, args, latency):
         """Boundary traffic of one call: read ``x`` and ``h_pre``, write ``out``."""
+        if not latency:
+            # The profiler can come back with no events on some runtimes; there
+            # is no bandwidth to report rather than an infinite one.
+            return 0.0
         x, h_pre = args[0], args[1]
         s, b, n, C = x.shape
         out_dtype = torch.promote_types(x.dtype, h_pre.dtype)
