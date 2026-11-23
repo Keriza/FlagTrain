@@ -13,29 +13,39 @@
 # limitations under the License.
 """Performance of the fused mHC projection + RMS + compute_h backward.
 
-The baseline is the same backward math in eager torch, fed the same saved
-forward tensors and upstream gradients, so the measurement isolates the
-backward kernels. Its expressions mirror the autograd of Megatron's
+There is no on-machine baseline: Megatron's ``fused_proj_rms_compute_h``
+backward is either the autograd derivative of its torch composition or, behind
+autograd, its cuTile backward. The composition is not a valid baseline and the
+cuTile backward is not reachable as a standalone callable, so ``torch_op`` is
+``None``: the benchmark reports Train latency only, and ``--base-data`` is the
+only comparison.
+
+The eager torch expressions below are still carried as ``_reference_backward``:
+the untimed check in ``_input_fn`` compares the operator against them, but they
+are never the timed baseline. They mirror the autograd of Megatron's
 ``_torch_proj_rms_compute_h`` (and Megatron's cuTile backward).
 
 Shapes, dtypes and the input construction match the forward benchmark; the
 saved ``h_pre`` / ``h_post`` / ``h_res`` / ``proj`` / ``r`` come from the
-FlagTrain forward once per shape, outside the timed region.
+reference forward once per shape, outside the timed region. The public
+FlagTrain forward returns Megatron's four outputs and keeps ``proj`` internal,
+so the benchmark builds it with the same reference that the untimed check
+differentiates.
 
 Precision caveat: the operator's fp32 matmuls use the backend's default
-precision (tf32 on NVIDIA) while the eager baseline is IEEE fp32, so the
-speedup includes that difference (the same caveat as the forward benchmark).
+precision (tf32 on NVIDIA) while the untimed check is IEEE fp32.
 
 Run::
 
     pytest benchmark/megatron -m fused_proj_rms_compute_h_backward --level core
 """
 
+import math
+
 import pytest
 import torch
 
 import flag_train
-from flag_train.megatron import fused_proj_rms_compute_h_forward
 
 from .. import base, consts
 
@@ -57,7 +67,12 @@ _WEIGHT_DTYPE = torch.float32
 _TOLERANCE = {torch.float16: 5e-3, torch.bfloat16: 2e-2}
 
 
-def torch_op(
+_BASELINE = (
+    "none (torch compositions are not timed; --base-data is the only comparison)"
+)
+
+
+def _reference_backward(
     x,
     weight,
     grad_h_pre,
@@ -77,7 +92,7 @@ def torch_op(
     eps=1e-6,
     compute_h_eps=1e-6,
 ):
-    """Eager backward of Megatron's torch forward from the saved tensors."""
+    """Untimed oracle: eager backward of Megatron's torch forward."""
     matmul_dtype = torch.promote_types(x.dtype, weight.dtype)
     inv = 1.0 / (r.float() + eps)
     sigmoid_pre = h_pre.float() - compute_h_eps
@@ -122,6 +137,42 @@ def torch_op(
     )
 
 
+def _reference_forward(
+    x,
+    weight,
+    alpha_pre,
+    alpha_post,
+    alpha_res,
+    bias,
+    n,
+    eps=1e-6,
+    compute_h_eps=1e-6,
+):
+    """Megatron's ``_torch_proj_rms_compute_h`` plus its internal projection.
+
+    Copied from ``megatron/core/fusions/fused_mhc_kernels.py``. The reduced
+    projection is returned as well so the benchmark can feed the backward the
+    same saved tensors the untimed check differentiates; the public FlagTrain
+    forward does not return it.
+    """
+    x = x.to(torch.promote_types(x.dtype, weight.dtype))
+    proj = torch.matmul(x, weight.t())
+    r = x.norm(dim=-1, keepdim=True) / math.sqrt(x.shape[-1])
+    alpha = torch.cat(
+        [
+            alpha_pre.expand(n),
+            alpha_post.expand(n),
+            alpha_res.expand(weight.shape[0] - 2 * n),
+        ],
+        dim=-1,
+    )
+    h = proj * alpha.unsqueeze(0) / (r + eps) + bias.unsqueeze(0)
+    h_pre = h[..., :n].sigmoid() + compute_h_eps
+    h_post = h[..., n : 2 * n].sigmoid() * 2
+    h_res = h[..., 2 * n :]
+    return h_pre, h_post, h_res, r, proj
+
+
 def _input_fn(shape, dtype, device):
     M, n, K = shape
     N = n * n + 2 * n
@@ -130,9 +181,16 @@ def _input_fn(shape, dtype, device):
     weight = torch.empty(N, K, dtype=_WEIGHT_DTYPE, device=device).uniform_(-0.1, 0.1)
     alpha = torch.full((1,), 0.01, dtype=torch.float32, device=device)
     bias = torch.zeros(N, dtype=torch.float32, device=device)
-    h_pre, h_post, h_res, r, proj = fused_proj_rms_compute_h_forward(
+    h_pre, h_post, h_res, r, proj = _reference_forward(
         x, weight, alpha, alpha, alpha, bias, n
     )
+    # ``h_res`` is a slice of the reference's [M, N] intermediate; the operator
+    # takes the contiguous saved tensors the forward returns.
+    h_pre = h_pre.contiguous()
+    h_post = h_post.contiguous()
+    h_res = h_res.contiguous()
+    r = r.contiguous()
+    proj = proj.contiguous()
 
     torch.manual_seed(1)
     grad_h_pre = torch.empty(M, n, dtype=h_pre.dtype, device=device).uniform_(-0.1, 0.1)
@@ -165,7 +223,7 @@ def _input_fn(shape, dtype, device):
 
     # One untimed correctness check per shape so both sides answer the same
     # question (the backward matmuls use tf32 for fp32 operands).
-    expected = torch_op(*args)
+    expected = _reference_backward(*args)
     got = flag_train.megatron.fused_proj_rms_compute_h_backward(*args)
     tolerance = _TOLERANCE[dtype]
     for name, result, ref in zip(
@@ -238,10 +296,13 @@ class ProjRmsComputeHBwdBenchmark(base.GenericBenchmark):
 )
 def test_fused_proj_rms_compute_h_backward_perf():
     """mHC's real case: bf16 activations with a keep_in_fp32 weight."""
+    print(f"\nBaseline: {_BASELINE}")
     bench = ProjRmsComputeHBwdBenchmark(
         input_fn=_input_fn,
         op_name="fused_proj_rms_compute_h_backward",
-        torch_op=torch_op,
+        # None by design: the available baseline is itself a torch composition,
+        # so nothing is timed and --base-data supplies the comparison.
+        torch_op=None,
         dtypes=_ACTIVATION_DTYPES,
     )
     bench.set_train(flag_train.megatron.fused_proj_rms_compute_h_backward)

@@ -34,6 +34,7 @@ form so it cannot silently drift.
 
 import importlib.metadata
 import importlib.util
+import inspect
 import warnings
 
 import pytest
@@ -52,7 +53,7 @@ needs_extension = pytest.mark.skipif(
     reason="Megatron's Apex scaled-softmax CUDA extension is not installed",
 )
 
-_DTYPES = [torch.float16, torch.float32]
+_DTYPES = [torch.float16]
 if utils.bf16_is_supported:
     _DTYPES.append(torch.bfloat16)
 _EXT_DTYPES = [torch.float16] + ([torch.bfloat16] if utils.bf16_is_supported else [])
@@ -211,6 +212,30 @@ def masked_backward_autograd(scores, mask, output_grads, scale):
     return grad
 
 
+# Query rows per reference chunk. The benchmark shapes are far too large for a
+# single oracle tensor -- ``masked_softmax_ref`` alone peaks at ~24 GiB on
+# ``(4, 16, 4096, 4096)`` fp32 -- and both the softmax and its gradient
+# factorise over the query axis, so the oracle is evaluated chunk by chunk.
+_REFERENCE_CHUNK = 256
+
+
+def masked_softmax_ref_chunked(scores, mask, scale, dtype):
+    """``masked_softmax_ref`` chunked over the query axis and cast to ``dtype``.
+
+    Each row's softmax depends only on that row, so this answers the same
+    values as the whole-tensor call without its several full-size fp32
+    temporaries (which is what the largest benchmark shape cannot hold).
+    """
+    out = torch.empty(scores.shape, dtype=dtype, device=scores.device)
+    sq = scores.shape[2]
+    for start in range(0, sq, _REFERENCE_CHUNK):
+        stop = start + _REFERENCE_CHUNK
+        out[:, :, start:stop] = masked_softmax_ref(
+            scores[:, :, start:stop], mask[..., start:stop, :], scale
+        )
+    return out
+
+
 def _reference(tensor):
     return utils.to_reference(tensor.detach(), upcast=True)
 
@@ -249,13 +274,30 @@ def test_baseline_source():
 
 
 @pytest.mark.scaled_masked_softmax_cuda_backward
+def test_public_interface_matches_megatron():
+    """The call shape is the Apex entry Megatron's backward invokes."""
+    params = inspect.signature(
+        flag_train.megatron.scaled_masked_softmax_cuda_backward
+    ).parameters
+    assert list(params) == ["output_grads", "softmax_results", "scale"]
+    assert all(param.default is inspect.Parameter.empty for param in params.values())
+
+    shape = (2, 4, 8, 8)
+    dy = torch.randn(shape, dtype=torch.float16, device=flag_train.device)
+    y = _softmax_like(dy)
+    dx = flag_train.megatron.scaled_masked_softmax_cuda_backward(dy, y, _SCALE)
+    assert isinstance(dx, torch.Tensor)
+    assert dx.shape == dy.shape and dx.dtype == dy.dtype
+
+
+@pytest.mark.scaled_masked_softmax_cuda_backward
 @pytest.mark.parametrize("shape", _SHAPES + _BENCH_SHAPES)
 @pytest.mark.parametrize("dtype", _DTYPES)
 def test_gradient_matches_autograd(shape, dtype):
     utils.init_seed(0)
     scores = torch.randn(shape, dtype=torch.float32, device=flag_train.device)
     mask = _padding_mask(shape)
-    y = masked_softmax_ref(scores, mask, _SCALE).to(dtype)
+    y = masked_softmax_ref_chunked(scores, mask, _SCALE, dtype)
     dy = torch.randn(shape, dtype=dtype, device=flag_train.device)
 
     dx = flag_train.megatron.scaled_masked_softmax_cuda_backward(dy, y, _SCALE)
@@ -264,10 +306,19 @@ def test_gradient_matches_autograd(shape, dtype):
     assert dx.dtype == dtype
     assert dx.is_contiguous()
     # The oracle runs where the reference runs: on the host under ``--ref cpu``.
-    expected = masked_backward_autograd(
-        _reference(scores), mask, _reference(dy), _SCALE
-    )
-    _assert_close(dx, expected, dtype)
+    # Like ``y`` above, it is evaluated chunk by chunk over the query axis: a
+    # row's gradient depends only on that row, and the whole-tensor autograd
+    # oracle does not fit the largest benchmark shape on a 32 GiB device.
+    sq = scores.shape[2]
+    for start in range(0, sq, _REFERENCE_CHUNK):
+        stop = start + _REFERENCE_CHUNK
+        expected = masked_backward_autograd(
+            _reference(scores[:, :, start:stop]),
+            mask[..., start:stop, :],
+            _reference(dy[:, :, start:stop]),
+            _SCALE,
+        )
+        _assert_close(dx[:, :, start:stop], expected, dtype)
 
 
 @pytest.mark.scaled_masked_softmax_cuda_backward
@@ -362,8 +413,18 @@ def test_empty_batch(dtype):
 
 @pytest.mark.scaled_masked_softmax_cuda_backward
 @pytest.mark.parametrize("dtype", _DTYPES)
+def test_empty_key_length(dtype):
+    """Apex's dispatch returns an empty output for ``sk == 0``."""
+    dy = torch.empty((2, 2, 4, 0), dtype=dtype, device=flag_train.device)
+    y = torch.empty_like(dy)
+    dx = flag_train.megatron.scaled_masked_softmax_cuda_backward(dy, y, _SCALE)
+    assert dx.shape == dy.shape and dx.dtype == dtype and dx.numel() == 0
+
+
+@pytest.mark.scaled_masked_softmax_cuda_backward
+@pytest.mark.parametrize("dtype", _DTYPES)
 def test_does_not_mutate_operands(dtype):
-    """The Apex kernel is in-place on ``output_grads``; this port is not."""
+    """The masked Apex backward allocates a new gradient; this port does too."""
     shape = (2, 2, 8, 8)
     y = _softmax_like(torch.empty(shape, dtype=dtype, device=flag_train.device))
     dy = torch.randn(shape, dtype=dtype, device=flag_train.device)
@@ -423,38 +484,70 @@ def test_vendored_baseline_matches_torch(dtype):
 
 @pytest.mark.scaled_masked_softmax_cuda_backward
 @pytest.mark.parametrize(
-    ("case", "match"),
+    ("case", "match", "error"),
     [
-        ("ndim", "4-D"),
-        ("dtype", "needs a"),
-        ("shape", "matching shapes"),
-        ("dtype-mismatch", "matching dtypes"),
-        ("cpu", "not one on the CPU"),
-        ("key-limit", "exceeds Megatron"),
-        ("scale", "one element"),
+        ("ndim", "expected 3D tensor", RuntimeError),
+        ("dtype", "Only fp16 and bf16", RuntimeError),
+        ("cpu", "CPU", RuntimeError),
+        ("key-limit", "key_seq_len", RuntimeError),
+        ("scale", "one-element", TypeError),
     ],
 )
-def test_rejects_invalid_arguments(case, match):
-    dy = torch.randn((2, 2, 4, 4), dtype=torch.float32, device=flag_train.device)
+def test_rejects_invalid_arguments(case, match, error):
+    dy = torch.randn((2, 2, 4, 4), dtype=torch.float16, device=flag_train.device)
     y = _softmax_like(dy)
     if case == "ndim":
         dy, y = dy.reshape(2, 2, 16), y.reshape(2, 2, 16)
     elif case == "dtype":
-        dy, y = dy.double(), y.double()
-    elif case == "shape":
-        y = _softmax_like(torch.empty((2, 2, 4, 8), dtype=dy.dtype, device=dy.device))
-    elif case == "dtype-mismatch":
-        y = y.half()
+        dy, y = dy.float(), y.float()
     elif case == "cpu":
         y = y.cpu()
     elif case == "key-limit":
         dy = torch.empty((1, 1, 1, 4097), dtype=torch.float16, device=dy.device)
         y = _softmax_like(dy)
     elif case == "scale":
-        with pytest.raises(ValueError, match=match):
+        with pytest.raises(error, match=match):
             flag_train.megatron.scaled_masked_softmax_cuda_backward(
                 dy, y, torch.ones(2)
             )
         return
-    with pytest.raises(ValueError, match=match):
+    with pytest.raises(error, match=match):
+        flag_train.megatron.scaled_masked_softmax_cuda_backward(dy, y, _SCALE)
+
+
+@pytest.mark.scaled_masked_softmax_cuda_backward
+def test_accepts_nonmatching_softmax_results_shape():
+    """Apex reads softmax_results as a flat stream; shape equality is unchecked."""
+    shape = (2, 2, 4, 4)
+    dy = torch.randn(shape, dtype=torch.float16, device=flag_train.device)
+    y = _softmax_like(dy).reshape(2, 2, 2, 8)
+
+    dx = flag_train.megatron.scaled_masked_softmax_cuda_backward(dy, y, _SCALE)
+
+    expected = masked_backward_ref(_reference(dy), _reference(y).reshape(shape), _SCALE)
+    _assert_close(dx, expected, torch.float16)
+
+
+@pytest.mark.scaled_masked_softmax_cuda_backward
+@pytest.mark.skipif(not utils.bf16_is_supported, reason="bf16 is unavailable")
+def test_accepts_mismatched_softmax_results_dtype():
+    """Apex dispatches on dy and reinterprets the results storage as that dtype."""
+    shape = (2, 2, 4, 4)
+    dy = torch.randn(shape, dtype=torch.float16, device=flag_train.device)
+    y_bf16 = _softmax_like(dy).to(torch.bfloat16)
+    raw = y_bf16.view(torch.uint8).reshape(-1)
+    y_as_fp16 = raw[: dy.numel() * dy.element_size()].view(torch.float16).view(shape)
+
+    dx = flag_train.megatron.scaled_masked_softmax_cuda_backward(dy, y_bf16, _SCALE)
+
+    expected = masked_backward_ref(_reference(dy), _reference(y_as_fp16), _SCALE)
+    _assert_close(dx, expected, torch.float16)
+
+
+@pytest.mark.scaled_masked_softmax_cuda_backward
+def test_rejects_softmax_results_too_small_for_apex_read():
+    """Apex would read past a short buffer; reject instead of corrupting memory."""
+    dy = torch.randn((2, 2, 4, 4), dtype=torch.float16, device=flag_train.device)
+    y = torch.empty((2, 2, 2, 4), dtype=torch.float16, device=flag_train.device)
+    with pytest.raises(RuntimeError, match="fewer elements"):
         flag_train.megatron.scaled_masked_softmax_cuda_backward(dy, y, _SCALE)

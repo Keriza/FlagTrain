@@ -13,12 +13,13 @@
 # limitations under the License.
 """Correctness tests for Megatron weighted squared ReLU (forward).
 
-The reference is Megatron-LM's ``weighted_squared_relu_impl``, required on every
-backend this operator ships on (``_MEGATRON_BASELINE_VENDORS``): the loader
-raises when Megatron -- or the plain weighted call itself -- cannot run at all.
+The preferred reference is Megatron-LM's ``weighted_squared_relu_impl``. On
+backends that do not use it, or when Megatron cannot be loaded or run, the
+loader warns and this suite compares against the PyTorch composition instead.
 megatron-core before 0.20.0 has no ``clamp_scale``, so the clamped cases skip
 there while the weighted ones still run against Megatron. One test also pins the
-PyTorch composition the benchmark falls back to against Megatron's.
+PyTorch composition the benchmark falls back to against Megatron's when it is
+available.
 
 Comparisons run on ``utils.to_reference(..., upcast=True)`` operands (fp32 on
 device, fp64 on CPU under ``--ref cpu``) with ``train_assert_close`` defaults.
@@ -28,6 +29,7 @@ import importlib.util
 import inspect
 import math
 import re
+import warnings
 from importlib import metadata
 
 import pytest
@@ -89,7 +91,8 @@ def _hide_broken_flash_attn_3():
 _hide_broken_flash_attn_3()
 
 # Both ranks of the interface, a hidden size that is not a multiple of the
-# kernel block, and empty tensors.
+# kernel block, and the 2-D empty case.  A zero-token 3-D input is rejected by
+# Megatron's epilogue reshape and is covered separately.
 _SHAPES = [
     (1, 1),
     (17, 1000),
@@ -97,7 +100,6 @@ _SHAPES = [
     (4, 8, 64),
     (1024, 4096),
     (0, 8),
-    (2, 0, 8),
 ]
 
 _CLAMP_SCALE = 5.0
@@ -109,6 +111,7 @@ _MEGATRON_BASELINE_VENDORS = {
     "hygon",
     "iluvatar",
     "metax",
+    "mthreads",
     "thead",
     "ascend",
 }
@@ -166,7 +169,8 @@ def _require_megatron_runs(op):
     """Prove the baseline can run the plain weighted case on this backend.
 
     The clamped cases may skip, but a baseline that cannot do the weighted case
-    describes no scenario at all, which is when this suite must raise.
+    describes no scenario at all, so warn and fall back to the PyTorch
+    composition.
     """
     x = torch.ones((2, 8), dtype=torch.float32, device=flag_train.device)
     weights = torch.ones((2, 1), dtype=torch.float32, device=flag_train.device)
@@ -185,37 +189,51 @@ def _require_megatron_runs(op):
         else:
             call()
     except Exception as exc:
-        raise RuntimeError(
-            f"{flag_train.vendor_name!r} must use Megatron's "
-            f"weighted_squared_relu_impl as its functional baseline, but it "
-            f"cannot run even the plain weighted case on this backend: {exc!r}."
-        ) from exc
+        warnings.warn(
+            f"Megatron's weighted_squared_relu_impl cannot run the plain "
+            f"weighted case on {flag_train.vendor_name!r}: {exc!r}. Falling "
+            f"back to the PyTorch composition.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return False
+    return True
 
 
 def _load_megatron_weighted_squared_relu():
-    """Megatron's reference, required on the backends this operator ships on.
+    """Megatron's reference, or ``None`` when it cannot be used here.
 
-    Mirrors ``_load_deepspeed_blocked_flash``: a baseline that cannot run
-    anything raises rather than falling back to a torch composition.
+    The loader warns before falling back to the PyTorch composition, so a
+    missing or unusable Megatron baseline is reported rather than failing the
+    module import.
     """
     if flag_train.vendor_name not in _MEGATRON_BASELINE_VENDORS:
+        warnings.warn(
+            f"{flag_train.vendor_name!r} does not use Megatron's "
+            f"weighted_squared_relu_impl as its reference; using the PyTorch "
+            f"composition instead.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         return None
     try:
         from megatron.core.fusions.fused_weighted_squared_relu import (
             weighted_squared_relu_impl,
         )
     except Exception as exc:
-        raise RuntimeError(
-            f"{flag_train.vendor_name!r} must use Megatron's "
-            f"weighted_squared_relu_impl as its functional baseline, but it could "
-            f"not be loaded: {exc!r}. Install Megatron-LM for this platform, or "
-            f"drop the backend from _MEGATRON_BASELINE_VENDORS."
-        ) from exc
+        warnings.warn(
+            "Megatron-LM is unavailable; using the PyTorch weighted squared "
+            f"ReLU composition as the reference ({exc!r}).",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return None
     if flag_train.vendor_name != "nvidia":
         # ``_require_megatron_runs`` below is the first call into the reference,
         # so the fuser must be switched off before it runs.
         _use_eager_megatron_reference()
-    _require_megatron_runs(weighted_squared_relu_impl)
+    if not _require_megatron_runs(weighted_squared_relu_impl):
+        return None
     return weighted_squared_relu_impl
 
 
@@ -229,12 +247,9 @@ _MEGATRON_HAS_CLAMP_SCALE = (
 
 
 def _megatron_weighted_squared_relu(x, weights, clamp_scale):
-    """Megatron's baseline for one case; clamped cases skip without ``clamp_scale``."""
+    """Megatron's baseline, or the PyTorch composition when it was not loaded."""
     if megatron_weighted_squared_relu_impl is None:
-        raise AssertionError(
-            f"{flag_train.vendor_name!r} has no Megatron baseline loaded; this "
-            f"suite compares against Megatron only."
-        )
+        return weighted_squared_relu_ref(x, weights, clamp_scale)
     if clamp_scale is not None and not _MEGATRON_HAS_CLAMP_SCALE:
         pytest.skip(
             f"megatron-core {_megatron_core_version() or '(unknown version)'} "
@@ -292,7 +307,7 @@ def _check(x, weights, clamp_scale):
     return y
 
 
-@pytest.mark.weighted_squared_relu
+@pytest.mark.weighted_squared_relu_impl
 @pytest.mark.parametrize("shape", _SHAPES)
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 def test_weighted_squared_relu(shape, dtype):
@@ -302,7 +317,7 @@ def test_weighted_squared_relu(shape, dtype):
     _check(x, weights, None)
 
 
-@pytest.mark.weighted_squared_relu
+@pytest.mark.weighted_squared_relu_impl
 @pytest.mark.parametrize("shape", _SHAPES)
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 def test_clamped_squared_relu(shape, dtype):
@@ -311,7 +326,7 @@ def test_clamped_squared_relu(shape, dtype):
     _check(x, None, _CLAMP_SCALE)
 
 
-@pytest.mark.weighted_squared_relu
+@pytest.mark.weighted_squared_relu_impl
 @pytest.mark.parametrize("shape", _SHAPES)
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 def test_weighted_clamped_squared_relu(shape, dtype):
@@ -321,11 +336,11 @@ def test_weighted_clamped_squared_relu(shape, dtype):
     _check(x, weights, _CLAMP_SCALE)
 
 
-@pytest.mark.weighted_squared_relu
-@pytest.mark.parametrize("weights_dtype", utils.FLOAT_DTYPES)
+@pytest.mark.weighted_squared_relu_impl
+@pytest.mark.parametrize("weights_dtype", utils.ALL_FLOAT_DTYPES)
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 def test_weighted_squared_relu_weight_dtype(dtype, weights_dtype):
-    """Per-token weights may be fp32 while the activation is bf16/fp16."""
+    """Weights may be wider than the activation, including fp64."""
     utils.init_seed(5)
     shape = (8, 32)
     x = torch.randn(shape, dtype=dtype, device=flag_train.device)
@@ -333,7 +348,34 @@ def test_weighted_squared_relu_weight_dtype(dtype, weights_dtype):
     _check(x, weights, None)
 
 
-@pytest.mark.weighted_squared_relu
+@pytest.mark.weighted_squared_relu_impl
+@pytest.mark.parametrize(
+    "weights_shape",
+    [(16, 1), (1, 1), (1, 64), (64,), (16, 64)],
+    ids=["per_token", "scalar", "per_column", "row_vector", "elementwise"],
+)
+def test_weighted_squared_relu_broadcast_weights(weights_shape):
+    """Megatron accepts any weights broadcastable to the flattened activation."""
+    utils.init_seed(12)
+    shape = (16, 64)
+    x = torch.randn(shape, dtype=torch.float32, device=flag_train.device)
+    weights = torch.rand(weights_shape, dtype=torch.float32, device=flag_train.device)
+    _check(x, weights, None)
+    _check(x, weights, _CLAMP_SCALE)
+
+
+@pytest.mark.weighted_squared_relu_impl
+@pytest.mark.skipif(not utils.fp64_is_supported, reason="device does not support fp64")
+def test_weighted_squared_relu_fp64():
+    """fp64 activations preserve Megatron's accepted input dtype."""
+    shape = (16, 64)
+    x = torch.randn(shape, dtype=torch.float64, device=flag_train.device)
+    weights = _weights_for(shape, torch.float64, seed=13)
+    _check(x, weights, None)
+    _check(x, weights, _CLAMP_SCALE)
+
+
+@pytest.mark.weighted_squared_relu_impl
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 def test_weighted_squared_relu_values(dtype):
     """Negative, zero, tiny, and clamp-saturating inputs with varied weights."""
@@ -360,7 +402,7 @@ def test_weighted_squared_relu_values(dtype):
     _check(x, weights, _CLAMP_SCALE)
 
 
-@pytest.mark.weighted_squared_relu
+@pytest.mark.weighted_squared_relu_impl
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 def test_weighted_squared_relu_noncontiguous(dtype):
     utils.init_seed(7)
@@ -377,23 +419,34 @@ def test_weighted_squared_relu_noncontiguous(dtype):
     transposed = cube.transpose(0, 2)
     assert not transposed.is_contiguous()
     transposed_weights = _weights_for(transposed.shape, torch.float32, seed=8)
-    _check(transposed, transposed_weights, _CLAMP_SCALE)
+    # Megatron's `input.view(-1, hidden)` cannot flatten this layout, so its
+    # forward raises before any arithmetic; mirror that instead of copying.
+    with pytest.raises(RuntimeError):
+        flag_train.megatron.weighted_squared_relu_impl(
+            transposed, transposed_weights, _CLAMP_SCALE
+        )
 
 
-@pytest.mark.weighted_squared_relu
+@pytest.mark.weighted_squared_relu_impl
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 def test_weighted_squared_relu_empty(dtype):
-    for shape in ((0, 8), (2, 0, 8)):
-        x = torch.empty(shape, dtype=dtype, device=flag_train.device)
-        weights = torch.empty(
-            (math.prod(shape[:-1]), 1), dtype=torch.float32, device=flag_train.device
-        )
-        y = _check(x, weights, None)
-        assert y.numel() == 0
-        _check(x, None, _CLAMP_SCALE)
+    shape = (0, 8)
+    x = torch.empty(shape, dtype=dtype, device=flag_train.device)
+    weights = torch.empty(
+        (math.prod(shape[:-1]), 1), dtype=torch.float32, device=flag_train.device
+    )
+    y = _check(x, weights, None)
+    assert y.numel() == 0
+    _check(x, None, _CLAMP_SCALE)
+
+    # Megatron's 3-D epilogue reshape fails for a zero-token 3-D input.
+    x = torch.empty((2, 0, 8), dtype=dtype, device=flag_train.device)
+    weights = torch.empty((0, 1), dtype=torch.float32, device=flag_train.device)
+    with pytest.raises(RuntimeError):
+        flag_train.megatron.weighted_squared_relu_impl(x, weights, None)
 
 
-@pytest.mark.weighted_squared_relu
+@pytest.mark.weighted_squared_relu_impl
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 def test_weighted_squared_relu_does_not_modify_inputs(dtype):
     utils.init_seed(9)
@@ -406,29 +459,25 @@ def test_weighted_squared_relu_does_not_modify_inputs(dtype):
     assert torch.equal(weights, weights_before)
 
 
-@pytest.mark.weighted_squared_relu
+@pytest.mark.weighted_squared_relu_impl
 def test_weighted_squared_relu_rejects_no_weights_and_no_clamp():
     x = torch.randn((16, 64), dtype=torch.bfloat16, device=flag_train.device)
     with pytest.raises(AssertionError):
         flag_train.megatron.weighted_squared_relu_impl(x, None, None)
 
 
-@pytest.mark.weighted_squared_relu
+@pytest.mark.weighted_squared_relu_impl
 def test_weighted_squared_relu_rejects_bad_weights_shape():
     x = torch.randn((16, 64), dtype=torch.float32, device=flag_train.device)
-    for shape in ((16,), (16, 2), (1, 1)):
+    for shape in ((16,), (16, 2), (2, 64)):
         weights = torch.rand(shape, dtype=torch.float32, device=flag_train.device)
-        with pytest.raises(ValueError, match="shape"):
+        # Megatron leaves the failure to ordinary torch broadcasting.
+        with pytest.raises(RuntimeError):
             flag_train.megatron.weighted_squared_relu_impl(x, weights)
 
 
-@pytest.mark.weighted_squared_relu
-def test_weighted_squared_relu_rejects_bad_input():
-    weights = torch.rand((16, 1), dtype=torch.float32, device=flag_train.device)
-    with pytest.raises(ValueError, match="tensor"):
-        flag_train.megatron.weighted_squared_relu_impl(
-            torch.zeros((16, 64), dtype=torch.int32, device=flag_train.device), weights
-        )
+@pytest.mark.weighted_squared_relu_impl
+def test_weighted_squared_relu_rejects_bad_rank():
     with pytest.raises(AssertionError):
         flag_train.megatron.weighted_squared_relu_impl(
             torch.randn((16,), dtype=torch.float32, device=flag_train.device),
@@ -436,7 +485,114 @@ def test_weighted_squared_relu_rejects_bad_input():
         )
 
 
-@pytest.mark.weighted_squared_relu
+@pytest.mark.weighted_squared_relu_impl
+def test_weighted_squared_relu_accepts_integer_input():
+    """Megatron accepts integer activations; the integer Triton path does too."""
+    x = torch.randint(0, 4, (16, 64), dtype=torch.int32, device=flag_train.device)
+    weights = torch.rand((16, 1), dtype=torch.float32, device=flag_train.device)
+    y = flag_train.megatron.weighted_squared_relu_impl(x, weights)
+    expected = _megatron_weighted_squared_relu(x, weights, None)
+    assert y.shape == x.shape and y.dtype == x.dtype
+    utils.train_assert_close(y, utils.to_reference(expected), x.dtype)
+
+
+@pytest.mark.weighted_squared_relu_impl
+def test_weighted_squared_relu_rejects_bool_input():
+    """Megatron's ``relu`` rejects bool; the Triton path must not emulate it."""
+    x = torch.randint(0, 4, (16, 64), dtype=torch.int32, device=flag_train.device)
+    x = x.bool()
+    weights = torch.rand((16, 1), dtype=torch.float32, device=flag_train.device)
+    with pytest.raises(ValueError, match="float or integer"):
+        flag_train.megatron.weighted_squared_relu_impl(x, weights)
+
+
+@pytest.mark.weighted_squared_relu_impl
+def test_weighted_squared_relu_accepts_cpu_input():
+    """CPU inputs are staged through the accelerator and the result returns on CPU."""
+    x = torch.randn((16, 64), dtype=torch.float32, device="cpu")
+    weights = torch.rand((16, 1), dtype=torch.float32, device="cpu")
+    y = flag_train.megatron.weighted_squared_relu_impl(x, weights)
+    expected = _megatron_weighted_squared_relu(x, weights, None)
+    assert y.device.type == "cpu"
+    utils.train_assert_close(y, utils.to_reference(expected), x.dtype)
+
+
+@pytest.mark.weighted_squared_relu_impl
+def test_weighted_squared_relu_rejects_complex_weights():
+    """Complex weights are outside the operator's real-valued contract."""
+    x = torch.randn((16, 64), dtype=torch.float32, device=flag_train.device)
+    weights = torch.rand((16, 1), dtype=torch.complex64).to(flag_train.device)
+    with pytest.raises(ValueError, match="real-valued"):
+        flag_train.megatron.weighted_squared_relu_impl(x, weights)
+    with pytest.raises(ValueError, match="real-valued"):
+        flag_train.megatron.weighted_squared_relu_impl(x, 1 + 2j)
+
+
+@pytest.mark.weighted_squared_relu_impl
+@pytest.mark.parametrize(
+    "clamp_shape", [(), (64,), (1, 64)], ids=["scalar", "vector", "row_vector"]
+)
+def test_weighted_squared_relu_rejects_complex_clamp(clamp_shape):
+    """Complex clamp scales are outside the operator's real-valued contract."""
+    x = torch.randn((16, 64), dtype=torch.float32, device=flag_train.device)
+    clamp = (torch.randn(clamp_shape, dtype=torch.complex64) + 2).to(flag_train.device)
+    with pytest.raises(ValueError, match="real-valued"):
+        flag_train.megatron.weighted_squared_relu_impl(x, None, clamp)
+    with pytest.raises(ValueError, match="real-valued"):
+        flag_train.megatron.weighted_squared_relu_impl(x, None, 1 + 2j)
+
+
+@pytest.mark.weighted_squared_relu_impl
+# Megatron's baseline is the reference here, and its own ``mul`` rejects
+# unsigned 16/32/64-bit operands on Ascend (``mul_out_npu_no_check``), so there
+# is nothing to compare against on that vendor.
+@pytest.mark.skipif(
+    flag_train.vendor_name == "ascend",
+    reason="Megatron's baseline mul rejects unsigned 16/32/64-bit weights "
+    "on Ascend (mul_out_npu_no_check)",
+)
+@pytest.mark.parametrize("dtype", [torch.uint16, torch.uint32, torch.uint64])
+def test_weighted_squared_relu_accepts_unsigned_weights(dtype):
+    """Unsigned 16/32/64-bit weights are valid torch operands for Megatron."""
+    x = torch.randn((16, 64), dtype=torch.float32, device=flag_train.device)
+    # Drawn on the CPU: some device RNGs reject unsigned 16/32/64-bit dtypes.
+    weights = torch.randint(0, 4, (16, 1), dtype=dtype).to(flag_train.device)
+    y = flag_train.megatron.weighted_squared_relu_impl(x, weights)
+    expected = _megatron_weighted_squared_relu(x, weights, None)
+    utils.train_assert_close(y, utils.to_reference(expected), x.dtype)
+
+
+@pytest.mark.weighted_squared_relu_impl
+def test_weighted_squared_relu_uint8_wraps_like_torch():
+    """torch casts negative float results to uint8 modulo 256, not saturation."""
+    x = torch.tensor([[1, 2, 3]], dtype=torch.uint8, device=flag_train.device)
+    weights = torch.tensor([[-3.1]], dtype=torch.float32, device=flag_train.device)
+    y = flag_train.megatron.weighted_squared_relu_impl(x, weights)
+    expected = _megatron_weighted_squared_relu(x, weights, None)
+    utils.train_assert_close(y, utils.to_reference(expected), x.dtype)
+
+
+@pytest.mark.weighted_squared_relu_impl
+@pytest.mark.parametrize(
+    ("shape", "weights_shape"),
+    [
+        ((2, 4), (1, 1, 4)),
+        ((2, 4), (1, 2, 4)),
+        ((2, 3, 4), (1, 1, 4)),
+        ((2, 3, 4), (1, 1, 6, 4)),
+    ],
+)
+def test_weighted_squared_relu_accepts_extra_weight_dims(shape, weights_shape):
+    """Megatron permits weights whose broadcast adds leading dimensions."""
+    x = torch.randn(shape, dtype=torch.float32, device=flag_train.device)
+    weights = torch.rand(weights_shape, dtype=torch.float32, device=flag_train.device)
+    y = flag_train.megatron.weighted_squared_relu_impl(x, weights)
+    expected = _megatron_weighted_squared_relu(x, weights, None)
+    assert y.shape == expected.shape
+    utils.train_assert_close(y, utils.to_reference(expected), x.dtype)
+
+
+@pytest.mark.weighted_squared_relu_impl
 @pytest.mark.skipif(
     megatron_weighted_squared_relu_impl is None,
     reason="Megatron-LM is not installed",
@@ -477,7 +633,13 @@ def weighted_squared_relu_ref(x, weights=None, clamp_scale=None):
         act = torch.pow(torch.relu(flat), 2)
     if weights is not None:
         act = act * weights
-    return act.to(x.dtype).reshape(ori_shape)
+    act = act.to(x.dtype)
+    # Megatron returns the broadcast result as-is for a 2-D input and only
+    # reshapes the token axis back for 3-D; mirror that so this composition can
+    # stand in for it as an oracle when Megatron is unavailable.
+    if len(ori_shape) == 2:
+        return act
+    return act.view(ori_shape[0], ori_shape[1], -1)
 
 
 # Two of the benchmark's core shapes, one 2-D and one 3-D. The comparison is
@@ -496,7 +658,7 @@ _COMPOSITION_VARIANTS = [
 ]
 
 
-@pytest.mark.weighted_squared_relu
+@pytest.mark.weighted_squared_relu_impl
 @pytest.mark.skipif(
     megatron_weighted_squared_relu_impl is None,
     reason="the torch composition is only cross-checked where Megatron runs",

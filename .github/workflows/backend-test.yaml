@@ -47,14 +47,13 @@
 #
 # The performance stage writes benchmark_result.json with --record json and
 # passes --base-data=tools/op_flagtrain_perf_baseline.json, then runs
-# tools/perf_summary.py: every shape uses compared_speedup when the NVIDIA
-# baseline matched (otherwise the local torch-baseline speedup), and the tool
-# writes per-dtype/op summaries (summary.json/csv/md) that are uploaded with
-# the accuracy report. --base-data is optional: a missing baseline disables
-# the "vs Base" column without failing the run. A benchmark whose baseline is
-# the upstream implementation (native_baseline) ignores --base-data outright:
-# the local ratio is already a real comparison, so its rows carry no
-# compared_speedup and the summary reports the Train Speedup.
+# tools/perf_summary.py: every shape uses the local torch-baseline speedup
+# when present (otherwise compared_speedup when the NVIDIA baseline matched),
+# and the tool writes per-dtype/op summaries (summary.json/csv/md) that are
+# uploaded with the accuracy report. --base-data is optional: a missing
+# baseline disables the "vs Base" column without failing the run. When an
+# operator has no on-machine baseline (torch_op is None), that column is its
+# only baseline.
 #
 # No shape uses a secret: a fork's PR builds and tests exactly like a branch
 # here.
@@ -313,6 +312,28 @@ jobs:
         with:
           fetch-depth: "1"
 
+      # The FlagOS index is the only source of the large FlagTree wheel, and
+      # the cluster's direct route to it is slow enough that the download never
+      # finishes. Relay the runner's HTTP proxy from repository/organization
+      # variables; when they are unset, leave whatever the runner already
+      # provides untouched.
+      - name: Configure HTTP proxy
+        env:
+          PROXY_HTTP: ${{ vars.HTTP_PROXY }}
+          PROXY_HTTPS: ${{ vars.HTTPS_PROXY }}
+          PROXY_NO: ${{ vars.NO_PROXY }}
+        run: |
+          if [ -n "${PROXY_HTTP}" ]; then
+            { echo "http_proxy=${PROXY_HTTP}"; echo "HTTP_PROXY=${PROXY_HTTP}"; } >>"${GITHUB_ENV}"
+          fi
+          if [ -n "${PROXY_HTTPS}" ]; then
+            { echo "https_proxy=${PROXY_HTTPS}"; echo "HTTPS_PROXY=${PROXY_HTTPS}"; } >>"${GITHUB_ENV}"
+          fi
+          if [ -n "${PROXY_NO}" ]; then
+            { echo "no_proxy=${PROXY_NO}"; echo "NO_PROXY=${PROXY_NO}"; } >>"${GITHUB_ENV}"
+          fi
+          echo "http proxy configured: $([ -n "${PROXY_HTTPS}${PROXY_HTTP}" ] && echo yes || echo no)"
+
       - name: Install FlagTrain and the test dependencies
         run: |
           # No venv is created here, and none should be: the job already runs
@@ -432,6 +453,24 @@ jobs:
       - uses: flagos-ai/FlagTrain/.github/actions/checkout-retry@main
         with:
           fetch-depth: "1"
+
+      - name: Configure HTTP proxy
+        shell: bash
+        env:
+          PROXY_HTTP: ${{ vars.HTTP_PROXY }}
+          PROXY_HTTPS: ${{ vars.HTTPS_PROXY }}
+          PROXY_NO: ${{ vars.NO_PROXY }}
+        run: |
+          if [ -n "${PROXY_HTTP}" ]; then
+            { echo "http_proxy=${PROXY_HTTP}"; echo "HTTP_PROXY=${PROXY_HTTP}"; } >>"${GITHUB_ENV}"
+          fi
+          if [ -n "${PROXY_HTTPS}" ]; then
+            { echo "https_proxy=${PROXY_HTTPS}"; echo "HTTPS_PROXY=${PROXY_HTTPS}"; } >>"${GITHUB_ENV}"
+          fi
+          if [ -n "${PROXY_NO}" ]; then
+            { echo "no_proxy=${PROXY_NO}"; echo "NO_PROXY=${PROXY_NO}"; } >>"${GITHUB_ENV}"
+          fi
+          echo "http proxy configured: $([ -n "${PROXY_HTTPS}${PROXY_HTTP}" ] && echo yes || echo no)"
 
       - name: Create the test environment
         shell: bash

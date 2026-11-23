@@ -33,9 +33,6 @@ _QUICK_GELU_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 # Megatron-LM ``quick_gelu`` multiplies the sigmoid argument by this.
 _ALPHA = 1.702
 
-# fp32 sigmoid is already 0 or 1 outside this range, and exp stays finite.
-_SIGMOID_CLAMP = 80.0
-
 
 def _check_input(tensor, name, dtypes):
     if tensor.dtype not in dtypes:
@@ -61,45 +58,23 @@ def _flatten(tensor):
 
 @libentry()
 @triton.jit
-def _quick_gelu_forward_kernel(x_ptr, y_ptr, n, alpha, clamp, BLOCK_SIZE: tl.constexpr):
+def _quick_gelu_forward_kernel(x_ptr, y_ptr, n, alpha, BLOCK_SIZE: tl.constexpr):
     """``y = x * sigmoid(alpha * x)``, Megatron-LM ``quick_gelu``.
 
-    The product is computed in fp32 and stored in the pointer dtype. ``alpha * x``
-    is clamped to ``[-clamp, clamp]`` first: beyond that, fp32 sigmoid is 0 or 1,
-    and ``exp`` of the unclamped value overflows.
+    The product is computed in fp32 and stored in the pointer dtype. The
+    sigmoid argument is deliberately not clamped: ``exp`` overflow in the
+    denominator lands on ``inf``, and ``1 / (1 + inf)`` is exactly 0, which
+    matches PyTorch. Clamping the argument would leave a ``1.8e-35`` floor on
+    the negative tail, and multiplying that floor by a large negative ``x`` is
+    not negligible.
     """
     pid = tle.program_id(0)
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n
 
     x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-    z = tl.minimum(tl.maximum(alpha * x, -clamp), clamp)
-    s = 1.0 / (1.0 + tl.exp(-z))
+    s = tl.sigmoid(alpha * x)
     tl.store(y_ptr + offsets, (x * s).to(y_ptr.dtype.element_ty), mask=mask)
-
-
-@libentry()
-@triton.jit
-def _quick_gelu_backward_kernel(
-    x_ptr, dy_ptr, dx_ptr, n, alpha, clamp, BLOCK_SIZE: tl.constexpr
-):
-    """Gradient of Megatron-LM ``quick_gelu``.
-
-    With ``z = alpha * x`` and ``s = sigmoid(z)``,
-    ``dx = dy * s * (1 + z * (1 - s))``. The same clamp as the forward kernel
-    is applied before ``exp``. At the clamp boundary ``s`` is already 0 or 1,
-    so the extra ``z * (1 - s)`` term is zero either way.
-    """
-    pid = tle.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n
-
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-    dy = tl.load(dy_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-    z = tl.minimum(tl.maximum(alpha * x, -clamp), clamp)
-    s = 1.0 / (1.0 + tl.exp(-z))
-    dx = dy * s * (1.0 + z * (1.0 - s))
-    tl.store(dx_ptr + offsets, dx.to(dx_ptr.dtype.element_ty), mask=mask)
 
 
 def _launch(kernel, args, n, device):
@@ -109,7 +84,6 @@ def _launch(kernel, args, n, device):
             *args,
             n,
             _ALPHA,
-            _SIGMOID_CLAMP,
             BLOCK_SIZE=_BLOCK_SIZE,
             num_warps=_NUM_WARPS,
         )
@@ -127,45 +101,8 @@ def _quick_gelu_forward(x):
     return out.view(x.shape)
 
 
-def _quick_gelu_backward(x, grad_output):
-    _check_input(x, "quick_gelu", _QUICK_GELU_DTYPES)
-    _check_input(grad_output, "quick_gelu grad", _QUICK_GELU_DTYPES)
-    if grad_output.shape != x.shape or grad_output.dtype != x.dtype:
-        raise ValueError(
-            "quick_gelu grad needs the same shape and dtype as the input, got "
-            f"{tuple(grad_output.shape)} {grad_output.dtype} for "
-            f"{tuple(x.shape)} {x.dtype}"
-        )
-    if x.numel() == 0:
-        return torch.empty_like(x)
-
-    flat_x = _flatten(x)
-    flat_dy = _flatten(grad_output)
-    dx = torch.empty_like(flat_x)
-    _launch(
-        _quick_gelu_backward_kernel,
-        (flat_x, flat_dy, dx),
-        flat_x.numel(),
-        x.device,
-    )
-    return dx.view(x.shape)
-
-
-class QuickGelu(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x):
-        ctx.save_for_backward(x)
-        return _quick_gelu_forward(x)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        logger.debug("TRAIN QUICK_GELU_BACKWARD")
-        (x,) = ctx.saved_tensors
-        return _quick_gelu_backward(x, grad_output)
-
-
 def quick_gelu(x):
-    """``x * sigmoid(1.702 * x)``, Megatron-LM Quick GELU.
+    """``x * sigmoid(1.702 * x)``, Megatron-LM Quick GELU. Forward only.
 
     Args:
         x (Tensor): fp16, bf16 or fp32 tensor on the active device. A
@@ -173,7 +110,7 @@ def quick_gelu(x):
             a launch.
 
     Returns:
-        Tensor: same shape and dtype as ``x``. Backward goes through autograd.
+        Tensor: same shape and dtype as ``x``, with no autograd history.
     """
     logger.debug("TRAIN QUICK_GELU")
-    return QuickGelu.apply(x)
+    return _quick_gelu_forward(x)

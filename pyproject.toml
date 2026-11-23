@@ -34,11 +34,22 @@ nvidia = [
     "deepspeed-kernels",
 ]
 
+ascend = [
+    "decorator==5.1.1",
+    "attrs==24.2.0",
+    "psutil==6.0.0",
+    "pandas==2.3.2",
+]
+
+thead = [
+    "megatron-core==0.17.1",
+]
 
 # --- END auto-generated from backends.yaml ---
 
 test = [
     "pytest>=8.0",
+    "scipy>=1.15.3,<1.18.0",
 ]
 
 [tool.uv]

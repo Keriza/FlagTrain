@@ -39,6 +39,15 @@ public forward dispatches to the cuTile kernel and its fused backward is what
 
 import torch
 
+# The collector profiles the backward under an NVTX range, but
+# torch.autograd.grad runs its backward kernels on autograd worker threads,
+# which do not inherit that thread-local range. Keep autograd on the calling
+# thread so Nsight Compute profiles the whole backward instead of nothing.
+try:
+    torch.autograd.set_multithreading_enabled(False)
+except AttributeError:
+    pass
+
 OP_NAME = "fused_proj_rms_compute_h_backward"
 DTYPES = [torch.float16, torch.bfloat16]
 IS_INPLACE = False
@@ -261,9 +270,12 @@ def config(binding, dtype):
             "proj": {"shape": [M, N], "dtype": matmul_dtype},
             "r": {"shape": [M, 1], "dtype": matmul_dtype},
             "grad_r_ext": {"shape": [M, 1], "dtype": matmul_dtype},
-            "alpha_pre": {"scalar": _GATING_FACTOR},
-            "alpha_post": {"scalar": _GATING_FACTOR},
-            "alpha_res": {"scalar": _GATING_FACTOR},
+            # build_inputs passes each alpha the way the benchmark does, as a
+            # torch.full((1,)) tensor. The lookup matches the runtime tensor
+            # signature exactly, so they are shapes here, not scalars.
+            "alpha_pre": {"shape": [1], "dtype": "torch.float32"},
+            "alpha_post": {"shape": [1], "dtype": "torch.float32"},
+            "alpha_res": {"shape": [1], "dtype": "torch.float32"},
             "bias": {"shape": [N], "dtype": "torch.float32"},
             "n": {"scalar": n},
         },

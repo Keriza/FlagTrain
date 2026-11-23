@@ -15,6 +15,7 @@
 import json
 import logging
 import os
+from pathlib import Path
 
 import pytest
 import torch
@@ -22,6 +23,14 @@ import yaml
 
 import flag_train
 from flag_train.cli_override import add_override_arguments, apply_overrides_from_args
+from flag_train.dummy_candidate import (
+    add_dummy_candidate_arguments,
+    configure_dummy_candidate,
+)
+from flag_train.reference_candidate import (
+    add_reference_candidate_argument,
+    configure_reference_candidate,
+)
 from flag_train.runtime import torch_device_fn
 
 from . import consts
@@ -49,6 +58,16 @@ REGISTERED_MARKS = []
 TEST_RESULTS = {}
 CASE_LISTS = []
 REPORT_FILE = "benchmark_result.json"
+
+
+class ProfileHooks:
+    @pytest.hookspec(firstresult=True)
+    def pytest_flaggems_profile_scope(self, backend, case_id):
+        """Return a context manager for candidate replay or None for plain replay."""
+
+
+def pytest_addhooks(pluginmanager):
+    pluginmanager.add_hookspecs(ProfileHooks)
 
 
 def update_result(op, data):
@@ -263,6 +282,13 @@ def pytest_addoption(parser):
         default=None,
         help="Benchmark only this exact workload ID. May be repeated.",
     )
+    parser.addoption(
+        "--profile-only",
+        action="store_true",
+        help="Replay exactly one case with candidate-only profiling.",
+    )
+    parser.addoption("--profile-warmup", type=int, default=10)
+    parser.addoption("--profile-iterations", type=int, default=1)
 
     parser.addoption(
         "--metrics",
@@ -283,10 +309,12 @@ def pytest_addoption(parser):
         required=False,
         choices=[
             str(ele).split(".")[-1]
-            for ele in consts.FLOAT_DTYPES
-            + consts.INT_DTYPES
-            + consts.BOOL_DTYPES
-            + [torch.cfloat]
+            for ele in consts.FLOAT_DTYPES + consts.INT_DTYPES + consts.BOOL_DTYPES
+            # fp64 is not a default dtype for every operator, but an operator
+            # that declares it (lamb) must be selectable by name here.  The
+            # benchmark's set_dtypes() still rejects it for operators that do
+            # not list it.
+            + [torch.float64, torch.cfloat]
         ],
         help=(
             "Specify the data types for benchmarks. "
@@ -313,7 +341,6 @@ def pytest_addoption(parser):
         )
         parser.addoption(
             "--output",
-            default=REPORT_FILE,
             help="Path to report file for JSON output",
         )
     except ValueError:
@@ -356,11 +383,12 @@ def pytest_addoption(parser):
 
     # Add dynamic operator override options
     add_override_arguments(parser)
+    add_reference_candidate_argument(parser)
+    add_dummy_candidate_arguments(parser)
 
 
 def pytest_configure(config):
     global Config  # noqa: F824
-    global REPORT_FILE
     global REGISTERED_MARKS
 
     config.addinivalue_line(
@@ -369,7 +397,9 @@ def pytest_configure(config):
     )
 
     Config = BenchConfig()
-    Config.base_data = _load_base_data(config.getoption("--base-data"))
+    Config.profile_only = config.getoption("--profile-only")
+    if not Config.profile_only:
+        Config.base_data = _load_base_data(config.getoption("--base-data"))
     CASE_LISTS.clear()
     TEST_RESULTS.clear()
 
@@ -385,6 +415,26 @@ def pytest_configure(config):
     Config.query = config.getoption("--query")
     Config.list_cases = config.getoption("--list-cases")
     Config.case_ids = config.getoption("--case-id")
+    Config.profile_warmup = config.getoption("--profile-warmup")
+    Config.profile_iterations = config.getoption("--profile-iterations")
+    Config.profile_hook = config.hook.pytest_flaggems_profile_scope
+    if Config.profile_only:
+        if len(Config.case_ids or ()) != 1:
+            raise pytest.UsageError("--profile-only requires exactly one --case-id.")
+        if Config.query or Config.list_cases:
+            raise pytest.UsageError(
+                "--profile-only cannot be combined with --query or --list-cases."
+            )
+        if config.option.collectonly or config.getoption("--collect-marks"):
+            raise pytest.UsageError(
+                "--profile-only cannot be combined with --collect-only or --collect-marks."
+            )
+        if config.getoption("--parallel") or config.getoption("numprocesses", 0):
+            raise pytest.UsageError("--profile-only requires serial execution.")
+        if Config.profile_warmup < 0 or Config.profile_iterations < 1:
+            raise pytest.UsageError(
+                "Profile warmup must be non-negative and iterations positive."
+            )
     if Config.list_cases and Config.case_ids is not None:
         raise pytest.UsageError("--list-cases cannot be combined with --case-id.")
     if Config.query and (Config.list_cases or Config.case_ids is not None):
@@ -415,14 +465,17 @@ def pytest_configure(config):
     shape_file_str = config.getoption("--shape_file")
     Config.shape_file = shape_file_str
 
-    Config.record_log = config.getoption("--record") == "log"
-    Config.record_json = config.getoption("--record") == "json"
+    Config.record_log = (
+        not Config.profile_only and config.getoption("--record") == "log"
+    )
+    Config.record_json = (
+        not Config.profile_only and config.getoption("--record") == "json"
+    )
 
     Config.parallel = int(config.getoption("--parallel") or 0)
     Config.mm_layout = config.getoption("--mm-layout")
     if Config.record_json or Config.list_cases:
-        Config.output = config.getoption("--output")
-        REPORT_FILE = Config.output
+        Config.output = config.getoption("--output") or REPORT_FILE
 
     if Config.record_log:
         cmd_args = [
@@ -449,7 +502,10 @@ def pytest_configure(config):
         emit_record_logger("Benchmark record logger enabled")
 
     # Apply dynamic operator overrides
-    config._override_registry = apply_overrides_from_args(config.option)
+    configure_reference_candidate(config)
+    configure_dummy_candidate(config)
+    if not hasattr(config, "_override_registry"):
+        config._override_registry = apply_overrides_from_args(config.option)
 
 
 def pytest_unconfigure(config):
@@ -586,8 +642,10 @@ def pytest_runtest_logreport(report):
 
 def pytest_terminal_summary(terminalreporter, exitstatus, config):
     """Combine and dump the result into JSON."""
+    if config.getoption("dummy_candidate"):
+        return
     if Config.list_cases:
-        with open(REPORT_FILE, "w") as f:
+        with open(Config.output, "w") as f:
             json.dump(
                 {
                     "schema_version": "flagtrain.benchmark-case-list/v2",
@@ -601,13 +659,13 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
         return
 
     data = TEST_RESULTS
-    if os.path.exists(REPORT_FILE):
-        with open(REPORT_FILE, "r") as f:
+    if os.path.exists(Config.output):
+        with open(Config.output, "r") as f:
             existing_data = json.load(f)
         existing_data.update(TEST_RESULTS)
         data = existing_data
 
-    with open(REPORT_FILE, "w") as f:
+    with open(Config.output, "w") as f:
         json.dump(data, f, indent=2, default=str)
 
 
@@ -629,6 +687,13 @@ def pytest_sessionfinish(session, exitstatus):
             pytest.ExitCode.NO_TESTS_COLLECTED,
         ):
             session.exitstatus = pytest.ExitCode.TESTS_FAILED
+        if (
+            unknown
+            and getattr(Config, "profile_only", False)
+            and hasattr(session.config, "_override_registry")
+        ):
+            # An unknown profile case cannot invoke the installed candidate.
+            session.config._override_registry.restore_all(allow_unused=True)
 
 
 def pytest_itemcollected(item):
@@ -636,6 +701,20 @@ def pytest_itemcollected(item):
 
 
 def pytest_collection_modifyitems(session, config, items):
+    if Config.profile_only:
+        nodeid = Config.case_ids[0].rsplit("::", 3)[0]
+        benchmark_dir = Path(__file__).resolve().parent
+        selected = [
+            item
+            for item in items
+            if item.nodeid == nodeid and benchmark_dir in item.path.parents
+        ]
+        deselected = [item for item in items if item not in selected]
+        if deselected:
+            items[:] = selected
+            config.hook.pytest_deselected(items=deselected)
+        return
+
     collect_marks_file = config.getoption("--collect-marks")
     if not collect_marks_file:
         return

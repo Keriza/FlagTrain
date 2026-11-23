@@ -13,17 +13,14 @@
 # limitations under the License.
 """Performance benchmark for Megatron Quick GELU.
 
-The preferred baseline is Megatron-LM's official
-``megatron.core.activations.quick_gelu`` interface. If Megatron-LM is not
-installed, the benchmark logs a warning and falls back to the equivalent
-PyTorch composition. Timing, warmup and synchronization come from
-``benchmark/base.py`` (``triton.testing.do_bench`` in kernel mode).
-``--level core`` runs the small, medium and large shapes below;
+The baseline is Megatron-LM's ``megatron.core.activations.quick_gelu``, the
+vendor implementation this operator ports. When Megatron-LM is unavailable the
+benchmark has no native baseline: ``torch_op`` is ``None`` and ``--base-data``
+is the only comparison, rather than timing a torch composition. Timing, warmup
+and synchronization come from ``benchmark/base.py`` (``triton.testing.do_bench``
+in kernel mode). ``--level core`` runs the small, medium and large shapes below;
 ``--level comprehensive`` adds the extra shapes.
 """
-
-import os
-import warnings
 
 import pytest
 import torch
@@ -44,33 +41,21 @@ _CORE_SHAPES = [
 ]
 
 
-def quick_gelu_ref(x):
-    return x * torch.sigmoid(1.702 * x)
-
-
 def _load_mcore_quick_gelu():
-    """Megatron-LM's ``quick_gelu``, or ``None`` when it is not the baseline."""
+    """Megatron's ``quick_gelu``, or ``None`` when it cannot be imported."""
     try:
-        import megatron.core.activations
-
-        return megatron.core.activations.quick_gelu
-    except ImportError:
-        warnings.warn(
-            "Megatron-LM is unavailable; using the PyTorch Quick GELU "
-            "composition as the benchmark baseline",
-            RuntimeWarning,
-            stacklevel=2,
-        )
+        from megatron.core.activations import quick_gelu
+    except Exception:
         return None
+    return quick_gelu
 
 
-# Resolved once, so the baseline is the same one ``native_baseline`` describes.
-_mcore_quick_gelu = _load_mcore_quick_gelu()
-
-
-def base_op():
-    """Baseline, chosen by platform. See ``_mcore_quick_gelu``."""
-    return _mcore_quick_gelu or quick_gelu_ref
+torch_op = _load_mcore_quick_gelu()
+_BASELINE = (
+    "megatron-core quick_gelu (@jit_fuser)"
+    if torch_op is not None
+    else "none (no on-machine baseline; --base-data is the only comparison)"
+)
 
 
 def _dtypes():
@@ -98,30 +83,19 @@ def quick_gelu_input_fn(shape, dtype, device):
 
 
 def _run(is_backward):
+    print(f"\nBaseline: {_BASELINE}")
+
     bench = QuickGeluBenchmark(
         input_fn=quick_gelu_input_fn,
         op_name="quick_gelu_backward" if is_backward else "quick_gelu",
-        torch_op=base_op(),
+        torch_op=torch_op,
         dtypes=_dtypes(),
         is_backward=is_backward,
-        # Megatron's own activation is a real local baseline; the torch
-        # composition is not, and --base-data still applies to it.
-        native_baseline=_mcore_quick_gelu is not None,
     )
     bench.set_train(flag_train.megatron.quick_gelu)
-    # On Ascend, enable parallel scheduling of all blocks to avoid excessive logical cores
-    # and reduce scheduling overhead when the logical core count exceeds 65,535.
-    # See https://github.com/flagos-ai/FlagGems/pull/7304
-    if flag_train.vendor_name == "ascend":
-        os.environ["TRITON_ALL_BLOCKS_PARALLEL"] = "1"
     bench.run()
 
 
 @pytest.mark.quick_gelu
 def test_quick_gelu_perf():
     _run(is_backward=False)
-
-
-@pytest.mark.quick_gelu
-def test_quick_gelu_backward_perf():
-    _run(is_backward=True)

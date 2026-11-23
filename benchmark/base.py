@@ -16,6 +16,7 @@ import gc
 import math
 import os
 import time
+from contextlib import nullcontext
 from dataclasses import asdict
 from typing import Any, Collection, Generator, List, Optional, Tuple
 
@@ -25,6 +26,13 @@ import triton
 import yaml
 
 import flag_train
+from flag_train.dummy_candidate import get_dummy_probe
+from flag_train.reference_candidate import (
+    ReferenceContractError,
+    reference_execution,
+    reference_mode_enabled,
+    select_candidate,
+)
 from flag_train.utils import shape_utils
 
 from . import consts
@@ -133,14 +141,6 @@ class Benchmark:
     DEFAULT_SHAPE_DESC = "M, N"
     DEFAULT_SHAPE_FILES = "core_shapes.yaml"
     EPS = 1e-7
-    # True when ``torch_op`` IS the upstream/vendor implementation (megatron-core,
-    # ``deepspeed.ops.*``, flash-attn, ...) rather than a plain-torch transcription
-    # of it. The local Torch-vs-Train ratio is then already a real comparison, so
-    # ``--base-data`` is ignored for this operator: there is no "vs Base" column,
-    # and tools/perf_summary.py summarizes the raw Train Speedup instead. Set it
-    # from the same runtime resolution that picks ``torch_op`` -- e.g.
-    # ``native_baseline=_deepspeed_lamb is not None``.
-    native_baseline: bool = False
     """
     the base class for the operations benchmark
     """
@@ -317,6 +317,38 @@ class Benchmark:
             return parsed_args, parsed_kwargs
         return parsed_args if parsed_args else parsed_kwargs
 
+    def baseline_shape_detail(self, *args, **kwargs):
+        """Shape detail used for the ``--base-data`` lookup.
+
+        ``record_shapes`` is what the report prints, and a benchmark may
+        compress it for readability (e.g. a long list of tensors on one line).
+        The baseline lookup needs the individual tensor dimensions to build
+        its signature, so it goes through this hook instead.
+
+        A tensor contributes its size *and* dtype, not its size alone: baseline
+        records describe their operands by both, and two variants of one shape
+        can differ only in a dtype -- a float32 gate beside a float16
+        activation, say. Keeping the dtype here is what lets the lookup pick
+        the variant's own record instead of the regular one.
+        """
+
+        def deep_parse(item):
+            if isinstance(item, torch.Tensor):
+                return (item.size(), item.dtype)
+            elif isinstance(item, (int, float, str, torch.dtype)):
+                return item
+            elif isinstance(item, (list, tuple)):
+                return [deep_parse(sub_item) for sub_item in item]
+            elif isinstance(item, dict):
+                return {key: deep_parse(value) for key, value in item.items()}
+            return None
+
+        parsed_args = [deep_parse(arg) for arg in args]
+        parsed_kwargs = {key: deep_parse(value) for key, value in kwargs.items()}
+        if parsed_args and parsed_kwargs:
+            return parsed_args, parsed_kwargs
+        return parsed_args if parsed_args else parsed_kwargs
+
     def init_default_config(self):
         self.set_shapes(self.DEFAULT_SHAPE_FILES)
 
@@ -340,16 +372,35 @@ class Benchmark:
     def set_train(self, train_op):
         self.train_op = train_op
 
-    def get_latency(self, op, *args, **kwargs):
+    def get_latency(self, op, *args, _reference_candidate=False, **kwargs):
         fn = lambda: op(*args, **kwargs)
         if self.is_backward:
+            # Building the graph is preparation: it happens before any timing
+            # and, on its own, does not prove the derivative ran.
             out = fn()
             dout = torch.randn_like(out)
             # fn = lambda: out.backward(dout, retain_graph=True)
             xs = list(filter(lambda x: torch.is_tensor(x) and x.requires_grad, args))
-            fn = lambda: torch.autograd.grad(
-                (out,), xs, grad_outputs=(dout,), retain_graph=True
-            )
+
+            def run_derivative():
+                return torch.autograd.grad(
+                    (out,), xs, grad_outputs=(dout,), retain_graph=True
+                )
+
+            fn = run_derivative
+            if _reference_candidate:
+                state = reference_execution()
+                if state is not None and state.enabled:
+
+                    def timed_reference_derivative():
+                        grads = run_derivative()
+                        # Only the actual timed autograd call on the selected
+                        # reference's graph counts; the baseline path does not
+                        # pass this flag and is never counted.
+                        state.candidate_derivative_calls += 1
+                        return grads
+
+                    fn = timed_reference_derivative
         if Config.mode == consts.BenchMode.OPERATOR:
             n_warm, n_rep = get_iter_count(fn)
             for i in range(n_warm):
@@ -529,17 +580,17 @@ class Benchmark:
         )
         if Config.native_baseline_skip_reason:
             result.native_baseline_skip_reason = Config.native_baseline_skip_reason
-        ignored_reason = self.base_data_ignored_reason()
-        if ignored_reason:
-            result.base_data_ignored = ignored_reason
         print(result)
         result_dict = asdict(result)
+        if reference_mode_enabled():
+            for metric_dict, metric in zip(result_dict["result"], result.result):
+                source = getattr(metric, "candidate_source", None)
+                if source:
+                    metric_dict["candidate_source"] = source
         if Config.native_baseline_skip_reason:
             result_dict["native_baseline_skip_reason"] = (
                 Config.native_baseline_skip_reason
             )
-        if ignored_reason:
-            result_dict["base_data_ignored"] = ignored_reason
         update_result(self.op_name, result_dict)
         emit_record_logger(result.to_json())
         return result
@@ -569,6 +620,10 @@ class Benchmark:
     def _run_cases(self, case_ids: Optional[Collection[str]]):
         cases = self._collect_cases()
         available_ids = [case.case_id for case in cases]
+        if reference_mode_enabled():
+            reference_execution().selection_empty = case_ids is not None and not set(
+                case_ids
+            ).intersection(available_ids)
 
         select_all = case_ids is None
         selected = set(case_ids or [])
@@ -600,17 +655,75 @@ class Benchmark:
         Config.executed_case_ids.update(executed)
         return results
 
-    def base_data_ignored_reason(self):
-        """Why ``--base-data`` does not apply here, or ``None`` when it does.
+    def _prepare_profile_call(self, case):
+        args, kwargs = self.unpack_to_args_kwargs(self.build_inputs(case))
+        op = self.train_op
+        if not self.is_backward:
+            return lambda: op(*args, **kwargs)
 
-        A benchmark whose ``torch_op`` is the upstream implementation
-        (``native_baseline``) already measures a real reference on this device,
-        so the cross-hardware figure would replace a better number with a
-        worse one.
+        out = op(*args, **kwargs)
+        dout = torch.randn_like(out)
+        grad_inputs = [x for x in args if torch.is_tensor(x) and x.requires_grad]
+
+        def derivative():
+            return torch.autograd.grad(
+                (out,), grad_inputs, grad_outputs=(dout,), retain_graph=True
+            )
+
+        return derivative
+
+    def _warmup_profile_case(self, case):
+        warmup = self._prepare_profile_call(case)
+        for _ in range(Config.profile_warmup):
+            warmup()
+        torch_device_fn.synchronize()
+
+    def _run_profile_case(self, case_id):
+        if not self.supports_cases():
+            raise ValueError(
+                f"Operator '{self.op_name}' does not support --profile-only yet."
+            )
+        cases = self._collect_cases()
+        Config.available_case_ids.update(case.case_id for case in cases)
+        case = next((case for case in cases if case.case_id == case_id), None)
+        if case is None:
+            return []
+        if case_id in Config.executed_case_ids:
+            raise ValueError(f"Multiple benchmarks supplied profile case '{case_id}'.")
+        if not callable(self.train_op):
+            raise ValueError(
+                f"--profile-only requires a train_op for '{self.op_name}'."
+            )
+
+        if Config.profile_warmup:
+            self._warmup_profile_case(case)
+        capture = self._prepare_profile_call(case)
+        torch_device_fn.synchronize()
+
+        scope = Config.profile_hook(backend=vendor_name, case_id=case_id)
+        with scope if scope is not None else nullcontext():
+            for _ in range(Config.profile_iterations):
+                capture()
+            torch_device_fn.synchronize()
+
+        Config.executed_case_ids.add(case_id)
+        return [case_id]
+
+    def _has_on_machine_baseline(self) -> bool:
+        """Whether ``torch_op`` can actually be timed on this machine.
+
+        Two independent reasons leave ``latency_base`` without a value:
+
+        * ``torch_op is None`` -- the vendor has no reference implementation at
+          all (the "vendor-native missing" case carried over from FlagGems-vllm,
+          e.g. a custom op that is absent on this backend);
+        * ``Config.skip_native`` -- a benchmark marker says this vendor's native
+          baseline is deliberately not measured.
+
+        In both cases the local ``speedup`` has no denominator and stays
+        ``None``; ``--base-data`` becomes the only available comparison.
         """
-        if Config.base_data is not None and self.native_baseline:
-            return "native baseline"
-        return None
+        return self.torch_op is not None and not Config.skip_native
 
     def _record_base_comparison(self, metric, dtype):
         """Fill ``compared_speedup`` from the optional NVIDIA baseline.
@@ -622,19 +735,29 @@ class Benchmark:
         """
         if Config.base_data is None or not metric.latency:
             return
-        if self.base_data_ignored_reason():
-            return
         base_rec, miss_reason = lookup_base_record_ex(
             Config.base_data,
             self.op_name,
             dtype,
-            metric.shape_detail,
+            getattr(metric, "baseline_shape_detail", metric.shape_detail),
             getattr(self, "base_variant", None),
         )
         base_ms = base_rec.get("latency_ms") if base_rec else None
         if base_ms is None:
             metric.base_miss_reason = miss_reason
             print(f"[vs Base][miss] {miss_reason}")
+            if self.torch_op is None and not Config.skip_native:
+                # Method A, ported from FlagGems-vllm: with no vendor-native
+                # implementation on this machine and no NV baseline record,
+                # no baseline exists at all. Fail instead of publishing a row
+                # whose speedup and compared_speedup are both None.
+                # ``skip_native`` is an explicit per-vendor opt-out, so it
+                # keeps the soft-miss behavior.
+                pytest.fail(
+                    f"no baseline available for '{self.op_name}' "
+                    f"(dtype={dtype}): vendor-native missing and NV baseline "
+                    f"unmatched ({miss_reason})"
+                )
             return
         # Both values are milliseconds, so the raw ratio is dimensionless.
         # Divide by this chip's scaling factor for the baseline's bottleneck
@@ -659,13 +782,62 @@ class Benchmark:
     def _measure_input(self, input, case_id=None):
         metric = BenchmarkMetrics(case_id=case_id)
         try:
+            reference_candidate = None
+            execution = None
+            if reference_mode_enabled():
+                execution = reference_execution()
+                # Select the explicit reference before any timing, including
+                # the native baseline. A missing or non-callable reference must
+                # surface as a contract error, never as a TypeError from the
+                # baseline timer.
+                reference_candidate = select_candidate(
+                    None, self.torch_op, self.op_name
+                )
             args, kwargs = self.unpack_to_args_kwargs(input)
             metric.shape_detail = self.record_shapes(*args, **kwargs)
-            if "latency_base" in self.to_bench_metrics and not Config.skip_native:
+            # Kept off the dataclass on purpose: serialized results carry the
+            # report form only. Only the baseline lookup reads this.
+            if Config.base_data is not None:
+                metric.baseline_shape_detail = self.baseline_shape_detail(
+                    *args, **kwargs
+                )
+            if (
+                "latency_base" in self.to_bench_metrics
+                and self._has_on_machine_baseline()
+            ):
                 metric.latency_base = self.get_latency(self.torch_op, *args, **kwargs)
             if "latency" in self.to_bench_metrics:
-                if self.train_op:
+                if reference_mode_enabled():
+                    if self.is_backward:
+                        before = execution.candidate_derivative_calls
+                    else:
+                        before = execution.candidate_calls
+                    metric.latency = self.get_latency(
+                        reference_candidate,
+                        *args,
+                        _reference_candidate=True,
+                        **kwargs,
+                    )
+                    if self.is_backward:
+                        executed = execution.candidate_derivative_calls > before
+                        preparation = "the candidate-side derivative"
+                    else:
+                        executed = execution.candidate_calls > before
+                        preparation = "the declared reference"
+                    if not executed:
+                        raise ReferenceContractError(
+                            f"{self.op_name}: reference candidate timer did "
+                            f"not execute {preparation}."
+                        )
+                    execution.completed_timings += 1
+                    metric.candidate_source = "reference"
+                elif self.train_op:
                     metric.latency = self.get_latency(self.train_op, *args, **kwargs)
+                elif self.torch_op is None:
+                    raise RuntimeError(
+                        "torch_op is None and no train_op was set: there is "
+                        "nothing to benchmark"
+                    )
                 else:
                     if self.op_name == "zero_":
                         with flag_train.use_train():
@@ -680,29 +852,25 @@ class Benchmark:
                                 self.torch_op, *args, **kwargs
                             )
             if "speedup" in self.to_bench_metrics:
-                if Config.skip_native:
-                    if metric.latency_base is not None and metric.latency is not None:
-                        metric.speedup = (metric.latency_base + self.EPS) / (
-                            metric.latency + self.EPS
-                        )
-                else:
+                # Both operands are required. With no on-machine baseline
+                # (torch_op None or skip_native) latency_base stays None, and
+                # the report shows N/A rather than dividing a nonexistent value.
+                if metric.latency_base is not None and metric.latency is not None:
                     metric.speedup = (metric.latency_base + self.EPS) / (
                         metric.latency + self.EPS
                     )
 
             if "gbps" in self.to_bench_metrics:
-                if Config.skip_native:
-                    if metric.latency_base is not None:
-                        metric.gbps_base = self.get_gbps(
-                            args, latency=metric.latency_base
-                        )
-                    if metric.latency is not None:
-                        metric.gbps = self.get_gbps(args, latency=metric.latency)
-                else:
+                if metric.latency_base is not None:
                     metric.gbps_base = self.get_gbps(args, latency=metric.latency_base)
+                if metric.latency is not None:
                     metric.gbps = self.get_gbps(args, latency=metric.latency)
 
-            if "tflops" in self.to_bench_metrics:
+            if (
+                "tflops" in self.to_bench_metrics
+                and self.torch_op is not None
+                and metric.latency is not None
+            ):
                 metric.tflops = (
                     self.get_tflops(self.torch_op, *args, **kwargs)
                     / metric.latency
@@ -731,18 +899,16 @@ class Benchmark:
             return
 
         self.init_user_config()
-        ignored_reason = self.base_data_ignored_reason()
-        if ignored_reason:
-            # Once per operator, not once per shape: what changes is which
-            # baseline CI reports, and that is the same for every row.
-            print(
-                f"[base-data] {self.op_name}: ignored ({ignored_reason}); the "
-                "'vs Base' column is hidden and the summary uses the Train "
-                "Speedup."
+        if reference_mode_enabled() and "latency" not in self.to_bench_metrics:
+            raise ReferenceContractError(
+                "--ref-as-candidate requires the candidate latency metric."
             )
         configured_case_ids = getattr(Config, "case_ids", None)
         selection_requested = case_ids is not None or configured_case_ids is not None
         selected_case_ids = case_ids if case_ids is not None else configured_case_ids
+
+        if getattr(Config, "profile_only", False):
+            return self._run_profile_case(configured_case_ids[0])
 
         if getattr(Config, "list_cases", False):
             if selected_case_ids:
@@ -752,6 +918,9 @@ class Benchmark:
             print(f"Listed {len(case_list.cases)} benchmark cases for {self.op_name}.")
             return case_list
 
+        probe = get_dummy_probe()
+        if probe is not None:
+            return probe.run_benchmark(self, selected_case_ids, Config)
         if selection_requested and not self.supports_cases():
             raise ValueError(
                 f"Operator '{self.op_name}' does not support --case-id yet."
