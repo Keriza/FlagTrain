@@ -21,8 +21,9 @@ contiguous transfer, and ``@libentry()`` takes the FlagGems launch fast path.
 15.7 ms without ``libentry``, 2.25 ms with it on the generic tile, 0.87 ms here;
 eager is 1.53 ms.
 
-The contract is unchanged: same shapes, dtype promotion, empty-axis behaviour,
-inputs read-only.
+The contract is unchanged: same shapes, the same output dtype (mixed operands are
+computed in the promoted dtype and the aggregate is cast back to ``x.dtype``, as
+Megatron does), empty-axis behaviour, inputs read-only.
 """
 
 import functools
@@ -132,7 +133,9 @@ def fused_h_aggregate_forward(
         h_pre (Tensor): ``[s, b, n]`` stream weights, any supported dtype.
 
     Returns:
-        Tensor: ``[s, b, C]`` in ``torch.promote_types(x.dtype, h_pre.dtype)``.
+        Tensor: ``[s, b, C]`` in ``x.dtype`` -- mixed operands are computed in
+        ``torch.promote_types(x.dtype, h_pre.dtype)`` inside the kernel and the
+        aggregate is cast back, which is Megatron's precision barrier.
     """
     _check_input(x, "x", 4)
     _check_input(h_pre, "h_pre", 3)
@@ -143,8 +146,9 @@ def fused_h_aggregate_forward(
         )
 
     s, b, n, C = x.shape
-    out_dtype = torch.promote_types(x.dtype, h_pre.dtype)
-    out = x.new_empty((s, b, C), dtype=out_dtype)
+    # Megatron casts the aggregate back to the activation dtype; keep that
+    # precision barrier instead of leaking a promoted dtype into the layer.
+    out = x.new_empty((s, b, C))
     if s == 0 or b == 0 or C == 0:
         return out
     if n == 0:
