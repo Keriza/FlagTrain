@@ -29,8 +29,10 @@ ops:
   stages:
   - beta: '0.0.0'
 - id: bias_gelu_impl
-  description: 'Fused bias addition and tanh-approximate GELU. Forward only; bias
-    addition rounds to the input dtype before FP32 activation arithmetic.'
+  description: 'Fused bias addition and tanh-approximate GELU. Forward only; follows
+    Megatron dtype promotion including Python scalar operands, integer/bool sums
+    return FP32, CPU inputs are staged through the accelerator, and complex inputs
+    are not supported.'
   for:
   - bias_gelu_impl
   labels:
@@ -309,6 +311,20 @@ ops:
   kind:
   - Normalization
   source: megatron.core.transformer.hyper_connection
+  stages:
+  - stable: '0.0.0'
+- id: l2_normalization
+  description: Last-dimension L2 normalization with first-order input gradients.
+  for:
+  - L2Normalization
+  labels:
+  - transformer_engine
+  - normalization
+  from:
+  - transformer_engine
+  kind:
+  - Normalization
+  source: transformer_engine.pytorch.ops.basic.l2normalization
   stages:
   - stable: '0.0.0'
 - id: l2_normalization_backward
