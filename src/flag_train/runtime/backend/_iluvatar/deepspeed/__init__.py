@@ -21,4 +21,9 @@ has all three.
 ``mixed_gemm`` is specialised here: the generic fused kernel cannot be pipelined
 on this backend's Triton and, unpipelined, stays 3-4x behind the vendor BLAS past
 L2.
+
+``loco_quantized_reduction`` is specialised here for the warp width alone: this
+torch does not expose ``max_threads_per_block``, so the generic launcher caps
+every case at 8 warps, while the two-pass kernel and the 4-bit 8192-byte group
+are 9-18% faster at 16. The module's docstring has the measurements.
 """
